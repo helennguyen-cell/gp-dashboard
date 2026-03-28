@@ -1,7 +1,4 @@
 streamlit
 pandas
-numpy
+mysql-connector-python
 plotly
-sqlalchemy
-psycopg2-binary
-pymysql

@@ -512,8 +512,8 @@ def main():
         mime="text/csv"
     )
     
-    # Tabs
-    tab1, tab2 = st.tabs(["📊 Current GP Analysis", "📈 Cost Impact Analysis"])
+        # Tabs
+    tab1, tab2, tab3 = st.tabs(["📊 Current GP Analysis", "📈 Cost Impact Analysis", "💰 Đề Xuất Giá Bán"])
     
     # ================== TAB 1: CURRENT GP ANALYSIS ==================
     with tab1:
@@ -641,18 +641,16 @@ def main():
             brand_analysis.columns = ['Brand', 'Revenue', 'GP USD', 'Products', 'GP%']
             st.dataframe(brand_analysis, use_container_width=True, hide_index=True)
         
-        # Product Rankings - UPDATED với Package Size
+        # Product Rankings
         st.markdown("---")
         col1, col2 = st.columns(2)
         
-        # Prepare display columns
         display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 'calculated_gp', 'calculated_gp_pct', 'gp_status']
         display_cols = [c for c in display_cols if c in df_filtered.columns]
         
         with col1:
             st.subheader("🏆 Top 20 High GP Products")
             top_products = df_filtered.nlargest(20, 'calculated_gp_pct')[display_cols].copy()
-            # Rename columns for display
             col_rename = {
                 'pt_code': 'PT Code',
                 'product_name': 'Product Name',
@@ -687,7 +685,6 @@ def main():
             labels={'system_gp_pct': 'System GP%', 'calculated_gp_pct': 'Calculated GP%'}
         )
         
-        # Add diagonal line
         max_val = max(df_filtered['system_gp_pct'].max(), df_filtered['calculated_gp_pct'].max())
         min_val = min(df_filtered['system_gp_pct'].min(), df_filtered['calculated_gp_pct'].min())
         fig_scatter.add_trace(go.Scatter(
@@ -880,11 +877,10 @@ def main():
             fig_hist.add_vline(x=0, line_dash="dash", line_color="gray")
             st.plotly_chart(fig_hist, use_container_width=True)
         
-        # Risk Assessment - UPDATED với Package Size
+        # Risk Assessment
         st.markdown("---")
         st.subheader("⚠️ Risk Assessment: Products Most Affected")
         
-        # Prepare impact display columns
         impact_display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 
                                'calculated_gp_pct', 'new_gp_pct', 'gp_change', 'status_before', 'status_after']
         impact_display_cols = [c for c in impact_display_cols if c in df_impact.columns]
@@ -941,47 +937,6 @@ def main():
             else:
                 st.success("✅ No products turned negative with this cost increase scenario!")
         
-        # Pricing Strategy
-        st.markdown("---")
-        st.subheader("💰 Pricing Strategy Recommendations")
-        
-        st.markdown(f"""
-        <div class="info-box">
-        <h4>To Maintain Current Margins After +{material_increase}% Material / +{freight_increase}% Freight:</h4>
-        <ul>
-            <li>Average price increase needed: <strong>{df_impact['price_increase_needed'].mean():.1f}%</strong></li>
-            <li>Products needing >10% increase: <strong>{len(df_impact[df_impact['price_increase_needed'] > 10]):,}</strong></li>
-            <li>Products needing >20% increase: <strong>{len(df_impact[df_impact['price_increase_needed'] > 20]):,}</strong></li>
-        </ul>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Detailed Pricing Table - UPDATED với Package Size
-        st.markdown("**Pricing Recommendations for At-Risk Products**")
-        at_risk = df_impact[df_impact['new_gp_pct'] < 15].sort_values('new_gp_pct')
-        
-        pricing_display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 
-                                'calculated_gp_pct', 'new_gp_pct', 'price_increase_needed', 'price_increase_for_15pct']
-        pricing_display_cols = [c for c in pricing_display_cols if c in at_risk.columns]
-        
-        at_risk_display = at_risk[pricing_display_cols].head(30).copy()
-        
-        pricing_col_rename = {
-            'pt_code': 'PT Code',
-            'product_name': 'Product',
-            'brand': 'Brand',
-            'package_size': 'Package',
-            'total_revenue': 'Revenue',
-            'calculated_gp_pct': 'Current GP%',
-            'new_gp_pct': 'New GP%',
-            'price_increase_needed': 'Increase to Maintain %',
-            'price_increase_for_15pct': 'Increase for 15% GP'
-        }
-        at_risk_display = at_risk_display.rename(
-            columns={k: v for k, v in pricing_col_rename.items() if k in at_risk_display.columns}
-        )
-        st.dataframe(at_risk_display, use_container_width=True, hide_index=True)
-        
         # Summary Alert
         if products_turned_negative > 0 or gp_pct_after < 15:
             st.markdown(f"""
@@ -993,15 +948,312 @@ def main():
                 <li>Overall GP% will drop from <strong>{gp_pct_before:.1f}%</strong> to <strong>{gp_pct_after:.1f}%</strong></li>
                 <li>Total GP loss: <strong>${abs(total_gp_loss):,.0f}</strong></li>
             </ul>
-            <p><strong>Recommended Actions:</strong></p>
-            <ol>
-                <li>Review pricing for products with GP% below 15%</li>
-                <li>Negotiate with suppliers for better material costs</li>
-                <li>Optimize logistics to reduce freight impact</li>
-                <li>Consider product rationalization for persistent negative GP items</li>
-            </ol>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # ================== TAB 3: ĐỀ XUẤT GIÁ BÁN ==================
+    with tab3:
+        st.header("💰 Đề Xuất Giá Bán Mới")
+        
+        st.markdown(f"""
+        <div class="info-box">
+        <h4>📋 Phương pháp tính giá đề xuất</h4>
+        <p>Giá bán đề xuất được tính dựa trên:</p>
+        <ul>
+            <li><strong>Chi phí mới</strong> = Chi phí hiện tại × (1 + % tăng Material) × (1 + % tăng Freight)</li>
+            <li><strong>Giá đề xuất</strong> = Chi phí mới / (1 - Target GP%)</li>
+            <li>Áp dụng kịch bản: Material +{material_increase}%, Freight +{freight_increase}%</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Pricing Settings
+        st.subheader("⚙️ Cài đặt Target GP%")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            target_gp_1 = st.number_input("Target GP% 1", value=15, min_value=5, max_value=50, step=1)
+        with col2:
+            target_gp_2 = st.number_input("Target GP% 2", value=20, min_value=5, max_value=50, step=1)
+        with col3:
+            target_gp_3 = st.number_input("Target GP% 3", value=25, min_value=5, max_value=50, step=1)
+        with col4:
+            target_gp_4 = st.number_input("Target GP% 4", value=30, min_value=5, max_value=50, step=1)
+        
+        # Calculate recommended prices
+        df_pricing = df_impact.copy()
+        
+        # Current average selling price
+        df_pricing['current_avg_price'] = df_pricing['total_revenue'] / df_pricing['total_quantity']
+        
+        # New unit cost after increase
+        df_pricing['new_unit_cost'] = df_pricing['new_unit_total_cost']
+        
+        # Calculate prices for each target GP
+        df_pricing[f'price_for_{target_gp_1}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_1/100)
+        df_pricing[f'price_for_{target_gp_2}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_2/100)
+        df_pricing[f'price_for_{target_gp_3}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_3/100)
+        df_pricing[f'price_for_{target_gp_4}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_4/100)
+        
+        # Calculate price increase percentages
+        df_pricing[f'increase_for_{target_gp_1}pct'] = ((df_pricing[f'price_for_{target_gp_1}pct'] / df_pricing['current_avg_price']) - 1) * 100
+        df_pricing[f'increase_for_{target_gp_2}pct'] = ((df_pricing[f'price_for_{target_gp_2}pct'] / df_pricing['current_avg_price']) - 1) * 100
+        df_pricing[f'increase_for_{target_gp_3}pct'] = ((df_pricing[f'price_for_{target_gp_3}pct'] / df_pricing['current_avg_price']) - 1) * 100
+        df_pricing[f'increase_for_{target_gp_4}pct'] = ((df_pricing[f'price_for_{target_gp_4}pct'] / df_pricing['current_avg_price']) - 1) * 100
+        
+        # Priority classification
+        def classify_priority(row):
+            if row['new_gp_pct'] < 0:
+                return '🔴 CRITICAL - Lỗ'
+            elif row['new_gp_pct'] < 10:
+                return '🟠 HIGH - GP < 10%'
+            elif row['new_gp_pct'] < 15:
+                return '🟡 MEDIUM - GP < 15%'
+            elif row['new_gp_pct'] < 20:
+                return '🟢 LOW - GP < 20%'
+            else:
+                return '✅ OK - GP >= 20%'
+        
+        df_pricing['priority'] = df_pricing.apply(classify_priority, axis=1)
+        df_pricing['priority_order'] = df_pricing['priority'].map({
+            '🔴 CRITICAL - Lỗ': 1,
+            '🟠 HIGH - GP < 10%': 2,
+            '🟡 MEDIUM - GP < 15%': 3,
+            '🟢 LOW - GP < 20%': 4,
+            '✅ OK - GP >= 20%': 5
+        })
+        
+        # Summary metrics
+        st.markdown("---")
+        st.subheader("📊 Tổng quan sản phẩm cần điều chỉnh giá")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        critical_count = len(df_pricing[df_pricing['new_gp_pct'] < 0])
+        high_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 0) & (df_pricing['new_gp_pct'] < 10)])
+        medium_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 10) & (df_pricing['new_gp_pct'] < 15)])
+        low_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 15) & (df_pricing['new_gp_pct'] < 20)])
+        ok_count = len(df_pricing[df_pricing['new_gp_pct'] >= 20])
+        
+        with col1:
+            st.metric("🔴 CRITICAL (Lỗ)", f"{critical_count}", delta="Cần xử lý ngay")
+        with col2:
+            st.metric("🟠 HIGH (GP<10%)", f"{high_count}", delta="Ưu tiên cao")
+        with col3:
+            st.metric("🟡 MEDIUM (GP<15%)", f"{medium_count}", delta="Cần review")
+        with col4:
+            st.metric("🟢 LOW (GP<20%)", f"{low_count}", delta="Theo dõi")
+        with col5:
+            st.metric("✅ OK (GP>=20%)", f"{ok_count}", delta="Ổn định")
+        
+        # Filter by priority
+        st.markdown("---")
+        st.subheader("🔍 Lọc theo mức độ ưu tiên")
+        
+        priority_filter = st.multiselect(
+            "Chọn mức độ ưu tiên:",
+            options=['🔴 CRITICAL - Lỗ', '🟠 HIGH - GP < 10%', '🟡 MEDIUM - GP < 15%', '🟢 LOW - GP < 20%', '✅ OK - GP >= 20%'],
+            default=['🔴 CRITICAL - Lỗ', '🟠 HIGH - GP < 10%', '🟡 MEDIUM - GP < 15%']
+        )
+        
+        if priority_filter:
+            df_pricing_filtered = df_pricing[df_pricing['priority'].isin(priority_filter)].copy()
+        else:
+            df_pricing_filtered = df_pricing.copy()
+        
+        df_pricing_filtered = df_pricing_filtered.sort_values(['priority_order', 'new_gp_pct'])
+        
+        # Main pricing table
+        st.markdown("---")
+        st.subheader(f"📋 Bảng Đề Xuất Giá Bán ({len(df_pricing_filtered)} sản phẩm)")
+        
+        # Prepare display dataframe
+        pricing_display = df_pricing_filtered[[
+            'pt_code', 'product_name', 'brand', 'package_size',
+            'total_revenue', 'total_quantity',
+            'current_avg_price', 'new_unit_cost',
+            'calculated_gp_pct', 'new_gp_pct',
+            f'price_for_{target_gp_1}pct', f'price_for_{target_gp_2}pct', 
+            f'price_for_{target_gp_3}pct', f'price_for_{target_gp_4}pct',
+            f'increase_for_{target_gp_2}pct',
+            'priority'
+        ]].copy()
+        
+        # Rename columns for display
+        pricing_display.columns = [
+            'PT Code', 'Tên Sản Phẩm', 'Brand', 'Package',
+            'Doanh Thu', 'Số Lượng',
+            'Giá TB Hiện Tại', 'Chi Phí Mới/Unit',
+            'GP% Hiện Tại', 'GP% Sau Tăng CP',
+            f'Giá Đề Xuất ({target_gp_1}%)', f'Giá Đề Xuất ({target_gp_2}%)',
+            f'Giá Đề Xuất ({target_gp_3}%)', f'Giá Đề Xuất ({target_gp_4}%)',
+            f'% Tăng Giá (Target {target_gp_2}%)',
+            'Mức Độ Ưu Tiên'
+        ]
+        
+        # Format numeric columns
+        for col in ['Doanh Thu', 'Giá TB Hiện Tại', 'Chi Phí Mới/Unit',
+                    f'Giá Đề Xuất ({target_gp_1}%)', f'Giá Đề Xuất ({target_gp_2}%)',
+                    f'Giá Đề Xuất ({target_gp_3}%)', f'Giá Đề Xuất ({target_gp_4}%)']:
+            if col in pricing_display.columns:
+                pricing_display[col] = pricing_display[col].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "N/A")
+        
+        for col in ['GP% Hiện Tại', 'GP% Sau Tăng CP', f'% Tăng Giá (Target {target_gp_2}%)']:
+            if col in pricing_display.columns:
+                pricing_display[col] = pricing_display[col].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "N/A")
+        
+        st.dataframe(pricing_display, use_container_width=True, hide_index=True, height=500)
+        
+        # Download section
+        st.markdown("---")
+        st.subheader("📥 Tải xuống báo cáo đề xuất giá")
+        
+        # Prepare export dataframe with all data
+        export_df = df_pricing_filtered[[
+            'pt_code', 'product_name', 'brand', 'package_size',
+            'total_revenue', 'total_quantity',
+            'current_avg_price', 'unit_material_cost', 'unit_freight_cost', 'unit_total_cost',
+            'new_unit_material_cost', 'new_unit_freight_cost', 'new_unit_cost',
+            'calculated_gp_pct', 'new_gp_pct',
+            f'price_for_{target_gp_1}pct', f'price_for_{target_gp_2}pct',
+            f'price_for_{target_gp_3}pct', f'price_for_{target_gp_4}pct',
+            f'increase_for_{target_gp_1}pct', f'increase_for_{target_gp_2}pct',
+            f'increase_for_{target_gp_3}pct', f'increase_for_{target_gp_4}pct',
+            'priority'
+        ]].copy()
+        
+        export_df.columns = [
+            'PT Code', 'Product Name', 'Brand', 'Package Size',
+            'Total Revenue USD', 'Total Quantity',
+            'Current Avg Price', 'Current Material Cost/Unit', 'Current Freight Cost/Unit', 'Current Total Cost/Unit',
+            'New Material Cost/Unit', 'New Freight Cost/Unit', 'New Total Cost/Unit',
+            'Current GP%', 'New GP% After Cost Increase',
+            f'Recommended Price ({target_gp_1}% GP)', f'Recommended Price ({target_gp_2}% GP)',
+            f'Recommended Price ({target_gp_3}% GP)', f'Recommended Price ({target_gp_4}% GP)',
+            f'Price Increase % for {target_gp_1}% GP', f'Price Increase % for {target_gp_2}% GP',
+            f'Price Increase % for {target_gp_3}% GP', f'Price Increase % for {target_gp_4}% GP',
+            'Priority Level'
+        ]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            csv_export = export_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Tải CSV - Đề Xuất Giá Đầy Đủ",
+                data=csv_export,
+                file_name=f"price_recommendation_{material_increase}pct_material_{freight_increase}pct_freight.csv",
+                mime="text/csv"
+            )
+        
+        with col2:
+            # Summary export
+            summary_data = {
+                'Metric': [
+                    'Total Products Analyzed',
+                    'Products Need Price Adjustment',
+                    'Critical (Negative GP)',
+                    'High Priority (GP < 10%)',
+                    'Medium Priority (GP < 15%)',
+                    f'Avg Price Increase for {target_gp_2}% GP',
+                    'Material Cost Increase Applied',
+                    'Freight Cost Increase Applied'
+                ],
+                'Value': [
+                    len(df_pricing),
+                    len(df_pricing[df_pricing['new_gp_pct'] < 20]),
+                    critical_count,
+                    high_count,
+                    medium_count,
+                    f"{df_pricing[f'increase_for_{target_gp_2}pct'].mean():.1f}%",
+                    f"{material_increase}%",
+                    f"{freight_increase}%"
+                ]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_csv = summary_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Tải CSV - Tóm Tắt",
+                data=summary_csv,
+                file_name=f"price_recommendation_summary.csv",
+                mime="text/csv"
+            )
+        
+        # Visual: Price Increase Distribution
+        st.markdown("---")
+        st.subheader("📈 Phân bổ mức tăng giá đề xuất")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_increase = px.histogram(
+                df_pricing_filtered,
+                x=f'increase_for_{target_gp_2}pct',
+                nbins=25,
+                color='priority',
+                title=f"Phân bổ % Tăng Giá để đạt {target_gp_2}% GP",
+                labels={f'increase_for_{target_gp_2}pct': '% Tăng Giá'},
+                color_discrete_sequence=['#e53935', '#FB8C00', '#FDD835', '#7CB342', '#43A047']
+            )
+            fig_increase.update_layout(height=400)
+            st.plotly_chart(fig_increase, use_container_width=True)
+        
+        with col2:
+            # Scatter: Current GP vs Required Price Increase
+            fig_scatter = px.scatter(
+                df_pricing_filtered,
+                x='new_gp_pct',
+                y=f'increase_for_{target_gp_2}pct',
+                size='total_revenue',
+                color='priority',
+                hover_data=['pt_code', 'product_name', 'brand'],
+                title=f"GP% Mới vs % Tăng Giá Cần Thiết (Target {target_gp_2}%)",
+                labels={
+                    'new_gp_pct': 'GP% Sau Tăng Chi Phí',
+                    f'increase_for_{target_gp_2}pct': '% Tăng Giá Cần Thiết'
+                },
+                color_discrete_sequence=['#e53935', '#FB8C00', '#FDD835', '#7CB342', '#43A047']
+            )
+            fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Không cần tăng")
+            fig_scatter.add_vline(x=target_gp_2, line_dash="dash", line_color="green", annotation_text=f"Target {target_gp_2}%")
+            fig_scatter.update_layout(height=400)
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        
+        # Quick Action Items
+        st.markdown("---")
+        st.subheader("🎯 Hành động đề xuất")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"""
+            <div class="alert-box">
+            <h4>🔴 Sản phẩm cần điều chỉnh giá NGAY ({critical_count + high_count} sản phẩm)</h4>
+            <ul>
+                <li><strong>{critical_count}</strong> sản phẩm đang LỖ sau khi tăng chi phí</li>
+                <li><strong>{high_count}</strong> sản phẩm có GP% dưới 10%</li>
+                <li>Tổng doanh thu ảnh hưởng: <strong>${df_pricing[df_pricing['new_gp_pct'] < 10]['total_revenue'].sum():,.0f}</strong></li>
+            </ul>
+            <p><strong>➡️ Đề xuất:</strong> Tăng giá theo cột "Giá Đề Xuất ({target_gp_2}%)" hoặc đàm phán lại với nhà cung cấp</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            avg_increase_critical = df_pricing[df_pricing['new_gp_pct'] < 10][f'increase_for_{target_gp_2}pct'].mean()
+            avg_increase_all = df_pricing[f'increase_for_{target_gp_2}pct'].mean()
+            
+            st.markdown(f"""
+            <div class="info-box">
+            <h4>📊 Tóm tắt điều chỉnh giá</h4>
+            <table style="width:100%">
+                <tr><td>Mức tăng giá TB (sản phẩm critical):</td><td><strong>{avg_increase_critical:.1f}%</strong></td></tr>
+                <tr><td>Mức tăng giá TB (tất cả):</td><td><strong>{avg_increase_all:.1f}%</strong></td></tr>
+                <tr><td>Sản phẩm cần tăng >20%:</td><td><strong>{len(df_pricing[df_pricing[f'increase_for_{target_gp_2}pct'] > 20])}</strong></td></tr>
+                <tr><td>Sản phẩm không cần tăng:</td><td><strong>{len(df_pricing[df_pricing[f'increase_for_{target_gp_2}pct'] <= 0])}</strong></td></tr>
+            </table>
             </div>
             """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
+

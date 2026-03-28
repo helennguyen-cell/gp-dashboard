@@ -1,1259 +1,978 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import mysql.connector
+from decimal import Decimal
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from sqlalchemy import create_engine, text
-import warnings
-warnings.filterwarnings('ignore')
 
-# Page config
-st.set_page_config(
-    page_title="GP Analysis Dashboard - Entity 43",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="GP Analysis Dashboard", layout="wide")
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1E88E5;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-    .sub-header {
-        font-size: 1.1rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-container {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-    }
-    .positive-gp {
-        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-    }
-    .negative-gp {
-        background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
-    }
-    .warning-gp {
-        background: linear-gradient(135deg, #F2994A 0%, #F2C94C 100%);
-    }
-    .info-box {
-        background-color: #e3f2fd;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #1E88E5;
-        margin: 1rem 0;
-    }
-    .alert-box {
-        background-color: #ffebee;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #e53935;
-        margin: 1rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Database connections
-@st.cache_resource
-def get_postgres_connection():
-    """Create PostgreSQL connection for sales data"""
-    try:
-        database_url = st.secrets.get("DATABASE_URL", "postgresql://postgres:VietnamFA2024@103.130.211.172:5432/postgres")
-        engine = create_engine(database_url, connect_args={"connect_timeout": 10})
-        return engine
-    except Exception as e:
-        st.warning(f"PostgreSQL connection error: {e}")
-        return None
-
-@st.cache_resource
-def get_mysql_connection():
-    """Create MySQL connection for product/brand master data"""
-    try:
-        # MySQL connection string format: mysql+pymysql://user:password@host:port/database
-        mysql_url = st.secrets.get("MYSQL_URL", "mysql+pymysql://user:password@host:3306/vietape")
-        engine = create_engine(mysql_url, connect_args={"connect_timeout": 10})
-        return engine
-    except Exception as e:
-        st.warning(f"MySQL connection error: {e}")
-        return None
-
-# Load product master data from MySQL
-@st.cache_data(ttl=3600)
-def load_product_master():
-    """Load product and brand master data from MySQL vietape database"""
-    
-    query = """
-    SELECT 
-        p.id as product_id,
-        p.pt_code,
-        p.name as product_name,
-        p.package_size,
-        p.uom,
-        p.brand_id,
-        b.brand_name,
-        p.hs_code,
-        p.description
-    FROM products p
-    LEFT JOIN brands b ON p.brand_id = b.id
-    WHERE p.delete_flag = 0
-    """
-    
-    try:
-        engine = get_mysql_connection()
-        if engine:
-            with engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
-                return df
-    except Exception as e:
-        st.warning(f"Could not load product master from MySQL: {e}")
-    
-    return None
-
-# Load sales data from PostgreSQL
-@st.cache_data(ttl=3600)
-def load_sales_data():
-    """Load sales data from PostgreSQL"""
-    
-    query = """
-    SELECT 
-        siv.product_id,
-        siv.sku,
-        siv.product_name as sales_product_name,
-        siv.pt_code as sales_pt_code,
-        siv.brand as sales_brand,
-        SUM(siv.net_amount_usd) as total_revenue,
-        SUM(siv.quantity) as total_quantity,
-        SUM(siv.net_amount_usd - siv.total_cost_usd) as system_gp,
-        AVG(siv.unit_price_usd) as avg_selling_price,
-        COUNT(DISTINCT siv.invoice_number) as invoice_count
-    FROM sales_invoice_full_looker_view siv
-    WHERE siv.entity_id = 43
-      AND siv.invoice_date >= '2024-01-01'
-      AND siv.net_amount_usd > 0
-      AND siv.quantity > 0
-    GROUP BY siv.product_id, siv.sku, siv.product_name, siv.pt_code, siv.brand
-    """
-    
-    try:
-        engine = get_postgres_connection()
-        if engine:
-            with engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
-                return df
-    except Exception as e:
-        st.warning(f"Could not load sales data from PostgreSQL: {e}")
-    
-    return None
-
-# Load BOM costs from PostgreSQL
-@st.cache_data(ttl=3600)
-def load_bom_costs():
-    """Load BOM-based costs from PostgreSQL"""
-    
-    query = """
-    WITH bom_costs AS (
-        SELECT 
-            fi.product_id,
-            COALESCE(SUM(
-                CASE 
-                    WHEN fi.material_id IS NOT NULL THEN 
-                        COALESCE(fi.quantity, 0) * COALESCE(
-                            (SELECT unit_price 
-                             FROM purchase_invoice_line pil 
-                             WHERE pil.material_id = fi.material_id 
-                             ORDER BY created_at DESC
-                             LIMIT 1), 0)
-                    ELSE 0 
-                END
-            ), 0) as material_cost,
-            COUNT(DISTINCT fi.material_id) as component_count
-        FROM finished_goods_inventory fi
-        WHERE fi.entity_id = 43
-        GROUP BY fi.product_id
+def get_connection():
+    return mysql.connector.connect(
+        host="erp-all-production.cx1uaj6vj8s5.ap-southeast-1.rds.amazonaws.com",
+        port=3306,
+        database="vietape",
+        user="helen_nguyen",
+        password="Helen@12398!",
+        consume_results=True
     )
-    SELECT * FROM bom_costs WHERE material_cost > 0
-    """
-    
-    try:
-        engine = get_postgres_connection()
-        if engine:
-            with engine.connect() as conn:
-                df = pd.read_sql(text(query), conn)
-                return df
-    except Exception as e:
-        st.warning(f"Could not load BOM costs: {e}")
-    
-    return None
 
-# Combine all data sources
-@st.cache_data(ttl=3600)
-def load_gp_data():
-    """Load and combine GP analysis data from all sources"""
-    
-    # Try to load real data
-    product_master = load_product_master()
-    sales_data = load_sales_data()
-    bom_costs = load_bom_costs()
-    
-    # Check if we have real data
-    if sales_data is not None and not sales_data.empty:
-        df = sales_data.copy()
-        
-        # Merge with product master from MySQL (for accurate names, brands, package sizes)
-        if product_master is not None and not product_master.empty:
-            df = df.merge(
-                product_master[['product_id', 'product_name', 'pt_code', 'package_size', 'brand_name', 'uom']],
-                on='product_id',
-                how='left',
-                suffixes=('_sales', '_master')
-            )
-            # Use master data where available, fallback to sales data
-            df['product_name'] = df['product_name'].fillna(df['sales_product_name'])
-            df['pt_code'] = df['pt_code'].fillna(df['sales_pt_code'])
-            df['brand'] = df['brand_name'].fillna(df['sales_brand'])
-        else:
-            df['product_name'] = df['sales_product_name']
-            df['pt_code'] = df['sales_pt_code']
-            df['brand'] = df['sales_brand']
-            df['package_size'] = None
-        
-        # Merge with BOM costs
-        if bom_costs is not None and not bom_costs.empty:
-            df = df.merge(bom_costs, on='product_id', how='left')
-            df['material_cost'] = df['material_cost'].fillna(0)
-            df['component_count'] = df['component_count'].fillna(0)
-        else:
-            df['material_cost'] = 0
-            df['component_count'] = 0
-        
-        # Calculate unit costs
-        df['unit_material_cost'] = np.where(
-            df['total_quantity'] > 0,
-            df['material_cost'] / df['total_quantity'],
-            0
-        )
-        df['unit_freight_cost'] = df['unit_material_cost'] * 0.15
-        df['unit_total_cost'] = df['unit_material_cost'] + df['unit_freight_cost']
-        
-        # Calculate GP
-        df['total_cogs'] = df['total_quantity'] * df['unit_total_cost']
-        df['calculated_gp'] = df['total_revenue'] - df['total_cogs']
-        df['calculated_gp_pct'] = np.where(
-            df['total_revenue'] > 0,
-            (df['calculated_gp'] / df['total_revenue'] * 100).round(2),
-            0
-        )
-        df['system_gp_pct'] = np.where(
-            df['total_revenue'] > 0,
-            (df['system_gp'] / df['total_revenue'] * 100).round(2),
-            0
-        )
-        
-        # BOM coverage
-        df['has_bom'] = df['material_cost'] > 0
-        df['bom_coverage'] = df['has_bom'].map({True: 'With BOM Cost', False: 'No BOM Cost'})
-        
-        return df
-    
-    # Fallback to sample data if no real data available
-    st.info("📊 Using sample data for demonstration. Connect to databases for real data.")
-    return generate_sample_data()
-
-def generate_sample_data():
-    """Generate realistic sample data for demonstration"""
-    np.random.seed(42)
-    n_products = 150
-    
-    # Realistic PT codes and brands based on vietape data
-    pt_codes = ['VTI001000001', 'VTI001000002', 'VTI001000003', 'VTI001000004', 
-                'VTI001000005', 'VTI001000006', 'VTI001000007', 'VTI001000008',
-                'VTI015000007', 'VTI001000009']
-    brands = ['Vietape', 'Inotech', '3M', 'Daesan', 'Tesa', 'Rogers', 'Vina Foam', 'F6']
-    package_sizes = ['500mmx33m', '44"x50m', '44"x100m', '1260mmx33m', '50mmx45m', 
-                     '47.50x33.70m', '0.13mmx18mmx18m', '25mmx50m', '100mmx33m']
-    
-    # Product names based on vietape
-    product_names = [
-        'Vietape SI3604 Kapton Tape', 'Vietape FP5302 Black PU foam', 
-        'Vietape FP5301 PU White 7T', 'Vietape Paper tape', 
-        'Băng keo điện PVC 3M Temflex', 'Vietape Pom7000 Ring Nhua',
-        'Inotech Pa7001 Nhua Band Nylon66', 'Anh Phát Băng Keo Pvc Màu Vàng Tươi',
-        'Mút xốp PU Foam 12T 44 Black', 'Băng keo giấy'
-    ]
-    
-    df = pd.DataFrame({
-        'product_id': range(1, n_products + 1),
-        'sku': [f'SKU-{i:04d}' for i in range(1, n_products + 1)],
-        'product_name': [np.random.choice(product_names) + f' #{i}' for i in range(1, n_products + 1)],
-        'pt_code': np.random.choice(pt_codes, n_products),
-        'brand': np.random.choice(brands, n_products),
-        'package_size': np.random.choice(package_sizes, n_products),
-        'total_revenue': np.random.exponential(15000, n_products) + 500,
-        'total_quantity': np.random.randint(10, 500, n_products),
-        'invoice_count': np.random.randint(1, 20, n_products),
-    })
-    
-    # Cost simulation - mix of products
-    cost_scenarios = np.random.choice(['low', 'medium', 'high', 'very_high', 'negative'], 
-                                       n_products, p=[0.2, 0.35, 0.25, 0.12, 0.08])
-    
-    cost_multipliers = {
-        'low': 0.55,
-        'medium': 0.72,
-        'high': 0.85,
-        'very_high': 0.95,
-        'negative': 1.08
-    }
-    
-    df['avg_selling_price'] = df['total_revenue'] / df['total_quantity']
-    df['unit_material_cost'] = df['avg_selling_price'] * [cost_multipliers[s] / 1.15 for s in cost_scenarios]
-    df['unit_freight_cost'] = df['unit_material_cost'] * 0.15
-    df['unit_total_cost'] = df['unit_material_cost'] + df['unit_freight_cost']
-    
-    df['total_cogs'] = df['total_quantity'] * df['unit_total_cost']
-    df['calculated_gp'] = df['total_revenue'] - df['total_cogs']
-    df['calculated_gp_pct'] = (df['calculated_gp'] / df['total_revenue'] * 100).round(2)
-    df['system_gp'] = df['calculated_gp'] * (1 + (np.random.rand(n_products) - 0.5) * 0.1)
-    df['system_gp_pct'] = (df['system_gp'] / df['total_revenue'] * 100).round(2)
-    
-    # BOM coverage - 80%+ have BOM
-    df['has_bom'] = np.random.rand(n_products) < 0.85
-    df['bom_coverage'] = df['has_bom'].map({True: 'With BOM Cost', False: 'No BOM Cost'})
-    df['component_count'] = np.where(df['has_bom'], np.random.randint(3, 15, n_products), 0)
-    
+def convert_decimals(df):
+    for col in df.columns:
+        if df[col].dtype == object:
+            try:
+                df[col] = df[col].apply(lambda x: float(x) if isinstance(x, Decimal) else x)
+            except:
+                pass
     return df
 
-def classify_gp_status(gp_pct):
-    """Classify GP percentage into status categories"""
-    if gp_pct < 0:
-        return 'NEGATIVE'
-    elif gp_pct < 10:
-        return 'CRITICAL'
-    elif gp_pct < 20:
-        return 'WARNING'
-    elif gp_pct < 30:
-        return 'GOOD'
-    else:
-        return 'EXCELLENT'
+st.title("📊 GP Analysis Dashboard - Starboard/Vietape")
 
-def get_status_color(status):
-    """Get color for each status"""
-    colors = {
-        'NEGATIVE': '#e53935',
-        'CRITICAL': '#FB8C00',
-        'WARNING': '#FDD835',
-        'GOOD': '#7CB342',
-        'EXCELLENT': '#43A047'
-    }
-    return colors.get(status, '#9E9E9E')
+# ============== CHECK SCHEMA ==============
+conn = get_connection()
+cursor = conn.cursor(dictionary=True)
 
-def calculate_cost_increase_impact(df, material_increase_pct, freight_increase_pct):
-    """Calculate impact of cost increases"""
-    result = df.copy()
-    
-    # New costs after increase
-    result['new_unit_material_cost'] = result['unit_material_cost'] * (1 + material_increase_pct / 100)
-    result['new_unit_freight_cost'] = result['unit_freight_cost'] * (1 + freight_increase_pct / 100)
-    result['new_unit_total_cost'] = result['new_unit_material_cost'] + result['new_unit_freight_cost']
-    
-    # New COGS and GP
-    result['new_total_cogs'] = result['total_quantity'] * result['new_unit_total_cost']
-    result['new_calculated_gp'] = result['total_revenue'] - result['new_total_cogs']
-    result['new_gp_pct'] = np.where(
-        result['total_revenue'] > 0,
-        (result['new_calculated_gp'] / result['total_revenue'] * 100).round(2),
-        0
-    )
-    
-    # Changes
-    result['gp_change'] = result['new_calculated_gp'] - result['calculated_gp']
-    result['gp_pct_change'] = result['new_gp_pct'] - result['calculated_gp_pct']
-    result['cogs_increase'] = result['new_total_cogs'] - result['total_cogs']
-    result['cogs_increase_pct'] = np.where(
-        result['total_cogs'] > 0,
-        ((result['new_total_cogs'] / result['total_cogs'] - 1) * 100).round(2),
-        0
-    )
-    
-    # Status before and after
-    result['status_before'] = result['calculated_gp_pct'].apply(classify_gp_status)
-    result['status_after'] = result['new_gp_pct'].apply(classify_gp_status)
-    result['status_changed'] = result['status_before'] != result['status_after']
-    
-    # Price needed to maintain margin
-    result['price_for_same_gp_pct'] = np.where(
-        result['calculated_gp_pct'] < 100,
-        result['new_total_cogs'] / (1 - result['calculated_gp_pct']/100),
-        result['new_total_cogs'] * 2
-    )
-    result['price_increase_needed'] = np.where(
-        result['total_revenue'] > 0,
-        ((result['price_for_same_gp_pct'] / result['total_revenue'] - 1) * 100).round(2),
-        0
-    )
-    
-    # Price for 15% minimum GP
-    result['price_for_15pct_gp'] = result['new_total_cogs'] / 0.85
-    result['price_increase_for_15pct'] = np.where(
-        result['total_revenue'] > 0,
-        ((result['price_for_15pct_gp'] / result['total_revenue'] - 1) * 100).round(2),
-        0
-    )
-    
-    return result
+cursor.execute("""
+    SELECT COLUMN_NAME 
+    FROM INFORMATION_SCHEMA.COLUMNS 
+    WHERE TABLE_SCHEMA = 'vietape' 
+    AND TABLE_NAME = 'sales_invoice_full_looker_view'
+""")
+columns = [row['COLUMN_NAME'] for row in cursor.fetchall()]
 
-# Main App
-def main():
-    st.markdown('<p class="main-header">📊 GP Analysis Dashboard</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Entity 43 (Starboard/Vietape) - Cost Impact Analysis | Products with ≥80% BOM Coverage</p>', unsafe_allow_html=True)
-    
-    # Load data
-    with st.spinner('Loading data...'):
-        df = load_gp_data()
-    
-    if df is None or df.empty:
-        st.error("No data available")
-        return
-    
-    # Filter for products with BOM cost (≥80% coverage)
-    df_with_bom = df[df['has_bom'] == True].copy()
-    
-    # Sidebar
-    st.sidebar.header("📈 Cost Increase Simulation")
-    st.sidebar.markdown("---")
-    
-    material_increase = st.sidebar.slider(
-        "📦 Material Cost Increase (%)",
-        min_value=0,
-        max_value=50,
-        value=10,
-        step=1,
-        help="Simulate material cost increase"
-    )
-    
-    freight_increase = st.sidebar.slider(
-        "🚚 Freight Cost Increase (%)",
-        min_value=0,
-        max_value=50,
-        value=15,
-        step=1,
-        help="Simulate freight/logistics cost increase"
-    )
-    
-    st.sidebar.markdown("---")
-    st.sidebar.header("🔍 Filters")
-    
-    # PT Code filter
-    pt_codes = ['All'] + sorted(df_with_bom['pt_code'].dropna().unique().tolist())
-    selected_pt = st.sidebar.selectbox("PT Code", pt_codes)
-    
-    # Brand filter
-    brands = ['All'] + sorted(df_with_bom['brand'].dropna().unique().tolist())
-    selected_brand = st.sidebar.selectbox("Brand", brands)
-    
-    # Package Size filter (NEW)
-    if 'package_size' in df_with_bom.columns:
-        package_sizes = ['All'] + sorted(df_with_bom['package_size'].dropna().unique().tolist())
-        selected_package = st.sidebar.selectbox("Package Size", package_sizes)
-    else:
-        selected_package = 'All'
-    
-    # Revenue filter
-    min_revenue = st.sidebar.number_input(
-        "Minimum Revenue (USD)",
-        min_value=0,
-        value=500,
-        step=100
-    )
-    
-    # Apply filters
-    df_filtered = df_with_bom.copy()
-    if selected_pt != 'All':
-        df_filtered = df_filtered[df_filtered['pt_code'] == selected_pt]
-    if selected_brand != 'All':
-        df_filtered = df_filtered[df_filtered['brand'] == selected_brand]
-    if selected_package != 'All' and 'package_size' in df_filtered.columns:
-        df_filtered = df_filtered[df_filtered['package_size'] == selected_package]
-    df_filtered = df_filtered[df_filtered['total_revenue'] >= min_revenue]
-    
-    # Add status column
-    df_filtered['gp_status'] = df_filtered['calculated_gp_pct'].apply(classify_gp_status)
-    
-    # Calculate impact
-    df_impact = calculate_cost_increase_impact(df_filtered, material_increase, freight_increase)
-    
-    # Data info
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"""
-    **📊 Data Summary**
-    - Total Products: {len(df_filtered):,}
-    - With BOM Cost: {df_filtered['has_bom'].sum():,}
-    - Date Range: 2024-01-01 to Present
+# Also check products table for package_size
+cursor.execute("""
+    SELECT COLUMN_NAME 
+    FROM INFORMATION_SCHEMA.COLUMNS 
+    WHERE TABLE_SCHEMA = 'vietape' 
+    AND TABLE_NAME = 'products'
+""")
+product_columns = [row['COLUMN_NAME'] for row in cursor.fetchall()]
+
+cursor.close()
+conn.close()
+
+with st.expander("📋 View Available Columns (Debug)"):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**sales_invoice_full_looker_view:**")
+        st.write(sorted(columns))
+    with col2:
+        st.write("**products table:**")
+        st.write(sorted(product_columns))
+
+# Check if package_size exists
+has_package_size_invoice = 'package_size' in columns or 'pkg_size' in columns
+has_package_size_product = 'package_size' in product_columns or 'pkg_size' in product_columns
+package_size_col = 'package_size' if 'package_size' in columns else 'pkg_size' if 'pkg_size' in columns else None
+
+# ============== SIDEBAR FILTERS ==============
+st.sidebar.header("🔍 Filters")
+
+conn = get_connection()
+cursor = conn.cursor(dictionary=True)
+
+# Date filter
+st.sidebar.subheader("📅 Time Period")
+date_options = {
+    "Last 30 days": 30,
+    "Last 3 months": 90,
+    "Last 6 months": 180,
+    "Last 12 months": 365,
+    "All time": 9999
+}
+selected_period = st.sidebar.selectbox("Select Period", list(date_options.keys()), index=2)
+days_back = date_options[selected_period]
+
+# Brand filter
+brand_col = 'brand' if 'brand' in columns else 'brand_name' if 'brand_name' in columns else None
+brand_id = None
+selected_brand = "All Brands"
+
+if brand_col:
+    cursor.execute(f"""
+        SELECT DISTINCT {brand_col} as brand_name
+        FROM sales_invoice_full_looker_view
+        WHERE legal_entity_id = 43 AND {brand_col} IS NOT NULL AND {brand_col} != ''
+        ORDER BY {brand_col}
     """)
+    brands = cursor.fetchall()
+    brand_options = {"All Brands": None}
+    brand_options.update({b['brand_name']: b['brand_name'] for b in brands if b['brand_name']})
+    selected_brand = st.sidebar.selectbox("Select Brand", list(brand_options.keys()))
+    brand_id = brand_options[selected_brand]
+
+# Package Size filter - NEW
+st.sidebar.subheader("📦 Package Size")
+if package_size_col:
+    cursor.execute(f"""
+        SELECT DISTINCT {package_size_col} as pkg_size
+        FROM sales_invoice_full_looker_view
+        WHERE legal_entity_id = 43 AND {package_size_col} IS NOT NULL AND {package_size_col} != ''
+        ORDER BY {package_size_col}
+    """)
+    pkg_sizes = cursor.fetchall()
+    pkg_options = {"All Sizes": None}
+    pkg_options.update({str(p['pkg_size']): p['pkg_size'] for p in pkg_sizes if p['pkg_size']})
+    selected_pkg = st.sidebar.selectbox("Select Package Size", list(pkg_options.keys()))
+    selected_pkg_size = pkg_options[selected_pkg]
+else:
+    selected_pkg_size = None
+    st.sidebar.info("Package size not available in invoice view")
+
+# GP Filter
+st.sidebar.subheader("📊 GP Filter")
+gp_filter = st.sidebar.selectbox("Filter by GP%", [
+    "All",
+    "Valid GP (< 100%)",
+    "GP 100% (Missing Cost)",
+    "Low GP (< 20%)",
+    "Medium GP (20-30%)",
+    "High GP (> 30%)"
+])
+
+# Product filter
+product_col = 'product_pn' if 'product_pn' in columns else 'product_name' if 'product_name' in columns else None
+product_pt_code = None
+
+if product_col:
+    product_query = f"""
+        SELECT DISTINCT {product_col} as product_name, pt_code 
+        FROM sales_invoice_full_looker_view
+        WHERE legal_entity_id = 43 AND {product_col} IS NOT NULL
+    """
+    if brand_id and brand_col:
+        product_query += f" AND {brand_col} = '{brand_id}'"
+    if selected_pkg_size and package_size_col:
+        product_query += f" AND {package_size_col} = '{selected_pkg_size}'"
+    product_query += f" ORDER BY {product_col} LIMIT 200"
     
-    # Download button
-    csv_data = df_impact.to_csv(index=False).encode('utf-8')
-    st.sidebar.download_button(
-        label="📥 Download Full Analysis (CSV)",
-        data=csv_data,
-        file_name="gp_impact_analysis.csv",
-        mime="text/csv"
-    )
+    cursor.execute(product_query)
+    products_list = cursor.fetchall()
+    product_options = {"All Products": None}
+    product_options.update({f"{p['product_name']}": p['pt_code'] for p in products_list if p['product_name']})
+    selected_product = st.sidebar.selectbox("Select Product", list(product_options.keys()))
+    product_pt_code = product_options[selected_product]
+
+cursor.close()
+conn.close()
+
+# Build WHERE clause
+def build_where_clause():
+    conditions = ["legal_entity_id = 43"]
+    if days_back < 9999:
+        conditions.append(f"inv_date >= DATE_SUB(CURDATE(), INTERVAL {days_back} DAY)")
+    if brand_id and brand_col:
+        conditions.append(f"{brand_col} = '{brand_id}'")
+    if selected_pkg_size and package_size_col:
+        conditions.append(f"{package_size_col} = '{selected_pkg_size}'")
+    if product_pt_code:
+        conditions.append(f"pt_code = '{product_pt_code}'")
     
-        # Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Current GP Analysis", "📈 Cost Impact Analysis", "💰 Đề Xuất Giá Bán"])
+    # GP Filter conditions
+    if gp_filter == "Valid GP (< 100%)":
+        conditions.append("gross_profit_percent < 100")
+    elif gp_filter == "GP 100% (Missing Cost)":
+        conditions.append("gross_profit_percent >= 100")
+    elif gp_filter == "Low GP (< 20%)":
+        conditions.append("gross_profit_percent < 20 AND gross_profit_percent >= 0")
+    elif gp_filter == "Medium GP (20-30%)":
+        conditions.append("gross_profit_percent >= 20 AND gross_profit_percent < 30")
+    elif gp_filter == "High GP (> 30%)":
+        conditions.append("gross_profit_percent >= 30 AND gross_profit_percent < 100")
     
-    # ================== TAB 1: CURRENT GP ANALYSIS ==================
-    with tab1:
-        st.header("Current GP Analysis (Before Cost Increase)")
-        
-        # Executive Summary
-        col1, col2, col3, col4 = st.columns(4)
-        
-        total_revenue = df_filtered['total_revenue'].sum()
-        total_cogs = df_filtered['total_cogs'].sum()
-        total_calculated_gp = df_filtered['calculated_gp'].sum()
-        total_system_gp = df_filtered['system_gp'].sum()
-        
-        with col1:
-            st.markdown(f"""
-            <div class="metric-container">
-                <h3>💰 Total Revenue</h3>
-                <h2>${total_revenue:,.0f}</h2>
-                <p>{len(df_filtered)} products</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown(f"""
-            <div class="metric-container negative-gp">
-                <h3>📦 Total COGS</h3>
-                <h2>${total_cogs:,.0f}</h2>
-                <p>{(total_cogs/total_revenue*100):.1f}% of Revenue</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            gp_class = "positive-gp" if total_calculated_gp > 0 else "negative-gp"
-            gp_pct = total_calculated_gp / total_revenue * 100
-            st.markdown(f"""
-            <div class="metric-container {gp_class}">
-                <h3>📊 Calculated GP</h3>
-                <h2>${total_calculated_gp:,.0f}</h2>
-                <p>GP%: {gp_pct:.1f}%</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col4:
-            system_gp_pct = total_system_gp / total_revenue * 100
-            variance = total_calculated_gp - total_system_gp
-            st.markdown(f"""
-            <div class="metric-container warning-gp">
-                <h3>🔄 System GP</h3>
-                <h2>${total_system_gp:,.0f}</h2>
-                <p>Variance: ${variance:,.0f}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # GP Distribution
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("🎯 GP Status Distribution")
-            status_counts = df_filtered['gp_status'].value_counts()
-            status_order = ['EXCELLENT', 'GOOD', 'WARNING', 'CRITICAL', 'NEGATIVE']
-            status_counts = status_counts.reindex([s for s in status_order if s in status_counts.index])
-            
-            fig_pie = px.pie(
-                values=status_counts.values,
-                names=status_counts.index,
-                color=status_counts.index,
-                color_discrete_map={s: get_status_color(s) for s in status_order},
-                hole=0.4
-            )
-            fig_pie.update_layout(height=350)
-            st.plotly_chart(fig_pie, use_container_width=True)
-        
-        with col2:
-            st.subheader("📊 GP% Distribution by Range")
-            
-            bins = [-100, 0, 10, 20, 30, 100]
-            labels = ['Negative (<0%)', 'Critical (0-10%)', 'Warning (10-20%)', 'Good (20-30%)', 'Excellent (>30%)']
-            df_filtered['gp_range'] = pd.cut(df_filtered['calculated_gp_pct'], bins=bins, labels=labels)
-            
-            range_counts = df_filtered['gp_range'].value_counts().sort_index()
-            
-            fig_bar = px.bar(
-                x=range_counts.index.astype(str),
-                y=range_counts.values,
-                color=range_counts.index.astype(str),
-                color_discrete_sequence=['#e53935', '#FB8C00', '#FDD835', '#7CB342', '#43A047']
-            )
-            fig_bar.update_layout(
-                height=350,
-                showlegend=False,
-                xaxis_title="GP Range",
-                yaxis_title="Number of Products"
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-        
-        # Analysis by Category
-        st.markdown("---")
-        st.subheader("📈 Analysis by Category")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**By PT Code**")
-            pt_analysis = df_filtered.groupby('pt_code').agg({
-                'total_revenue': 'sum',
-                'calculated_gp': 'sum',
-                'product_id': 'count'
-            }).reset_index()
-            pt_analysis['gp_pct'] = (pt_analysis['calculated_gp'] / pt_analysis['total_revenue'] * 100).round(2)
-            pt_analysis = pt_analysis.sort_values('total_revenue', ascending=False)
-            pt_analysis.columns = ['PT Code', 'Revenue', 'GP USD', 'Products', 'GP%']
-            st.dataframe(pt_analysis, use_container_width=True, hide_index=True)
-        
-        with col2:
-            st.markdown("**By Brand**")
-            brand_analysis = df_filtered.groupby('brand').agg({
-                'total_revenue': 'sum',
-                'calculated_gp': 'sum',
-                'product_id': 'count'
-            }).reset_index()
-            brand_analysis['gp_pct'] = (brand_analysis['calculated_gp'] / brand_analysis['total_revenue'] * 100).round(2)
-            brand_analysis = brand_analysis.sort_values('total_revenue', ascending=False)
-            brand_analysis.columns = ['Brand', 'Revenue', 'GP USD', 'Products', 'GP%']
-            st.dataframe(brand_analysis, use_container_width=True, hide_index=True)
-        
-        # Product Rankings
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        
-        display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 'calculated_gp', 'calculated_gp_pct', 'gp_status']
-        display_cols = [c for c in display_cols if c in df_filtered.columns]
-        
-        with col1:
-            st.subheader("🏆 Top 20 High GP Products")
-            top_products = df_filtered.nlargest(20, 'calculated_gp_pct')[display_cols].copy()
-            col_rename = {
-                'pt_code': 'PT Code',
-                'product_name': 'Product Name',
-                'brand': 'Brand',
-                'package_size': 'Package Size',
-                'total_revenue': 'Revenue',
-                'calculated_gp': 'GP USD',
-                'calculated_gp_pct': 'GP%',
-                'gp_status': 'Status'
-            }
-            top_products = top_products.rename(columns={k: v for k, v in col_rename.items() if k in top_products.columns})
-            st.dataframe(top_products, use_container_width=True, hide_index=True)
-        
-        with col2:
-            st.subheader("⚠️ Top 20 Low/Negative GP Products")
-            bottom_products = df_filtered.nsmallest(20, 'calculated_gp_pct')[display_cols].copy()
-            bottom_products = bottom_products.rename(columns={k: v for k, v in col_rename.items() if k in bottom_products.columns})
-            st.dataframe(bottom_products, use_container_width=True, hide_index=True)
-        
-        # GP Variance Analysis
-        st.markdown("---")
-        st.subheader("🔍 GP Variance: System vs Calculated")
-        
-        fig_scatter = px.scatter(
-            df_filtered,
-            x='system_gp_pct',
-            y='calculated_gp_pct',
-            size='total_revenue',
-            color='gp_status',
-            color_discrete_map={s: get_status_color(s) for s in ['EXCELLENT', 'GOOD', 'WARNING', 'CRITICAL', 'NEGATIVE']},
-            hover_data=['pt_code', 'product_name', 'brand', 'total_revenue'],
-            labels={'system_gp_pct': 'System GP%', 'calculated_gp_pct': 'Calculated GP%'}
-        )
-        
-        max_val = max(df_filtered['system_gp_pct'].max(), df_filtered['calculated_gp_pct'].max())
-        min_val = min(df_filtered['system_gp_pct'].min(), df_filtered['calculated_gp_pct'].min())
-        fig_scatter.add_trace(go.Scatter(
-            x=[min_val, max_val],
-            y=[min_val, max_val],
-            mode='lines',
-            line=dict(dash='dash', color='gray'),
-            name='Perfect Match'
-        ))
-        
-        fig_scatter.update_layout(height=500)
-        st.plotly_chart(fig_scatter, use_container_width=True)
+    return " AND ".join(conditions)
+
+# ============== TABS ==============
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 GP Overview", "⚠️ Data Quality", "💰 Cost Analysis", "🔄 Cost Simulation", "🎯 Recommendations"])
+
+# ============== TAB 1: GP OVERVIEW ==============
+with tab1:
+    st.header("Gross Profit Overview")
     
-    # ================== TAB 2: COST IMPACT ANALYSIS ==================
-    with tab2:
-        st.header(f"Cost Impact Analysis: Material +{material_increase}%, Freight +{freight_increase}%")
-        
-        # Impact Summary
-        st.subheader("📊 Impact Summary")
-        
-        total_new_cogs = df_impact['new_total_cogs'].sum()
-        total_new_gp = df_impact['new_calculated_gp'].sum()
-        total_cogs_increase = total_new_cogs - total_cogs
-        total_gp_loss = total_new_gp - total_calculated_gp
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric(
-                "COGS Before",
-                f"${total_cogs:,.0f}",
-                delta=None
-            )
-            st.metric(
-                "COGS After",
-                f"${total_new_cogs:,.0f}",
-                delta=f"+${total_cogs_increase:,.0f}",
-                delta_color="inverse"
-            )
-        
-        with col2:
-            st.metric(
-                "GP Before",
-                f"${total_calculated_gp:,.0f}",
-                delta=f"{(total_calculated_gp/total_revenue*100):.1f}%"
-            )
-            st.metric(
-                "GP After",
-                f"${total_new_gp:,.0f}",
-                delta=f"{total_gp_loss:,.0f}",
-                delta_color="inverse"
-            )
-        
-        with col3:
-            gp_pct_before = total_calculated_gp / total_revenue * 100
-            gp_pct_after = total_new_gp / total_revenue * 100
-            pct_drop = gp_pct_after - gp_pct_before
-            
-            st.metric(
-                "GP% Before",
-                f"{gp_pct_before:.1f}%",
-                delta=None
-            )
-            st.metric(
-                "GP% After",
-                f"{gp_pct_after:.1f}%",
-                delta=f"{pct_drop:.1f} pts",
-                delta_color="inverse"
-            )
-        
-        with col4:
-            products_turned_negative = len(df_impact[
-                (df_impact['calculated_gp_pct'] >= 0) & (df_impact['new_gp_pct'] < 0)
-            ])
-            products_status_dropped = df_impact['status_changed'].sum()
-            
-            st.metric(
-                "Products Turned Negative",
-                f"{products_turned_negative}",
-                delta="⚠️ Alert" if products_turned_negative > 0 else "✅ OK",
-                delta_color="inverse" if products_turned_negative > 0 else "normal"
-            )
-            st.metric(
-                "Products Status Changed",
-                f"{products_status_dropped}",
-                delta=f"of {len(df_impact)}"
-            )
-        
-        # Cost Breakdown
-        st.markdown("---")
-        st.subheader("📦 Cost Breakdown Comparison")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Before Increase**")
-            total_material_before = (df_impact['unit_material_cost'] * df_impact['total_quantity']).sum()
-            total_freight_before = (df_impact['unit_freight_cost'] * df_impact['total_quantity']).sum()
-            
-            fig_before = px.pie(
-                values=[total_material_before, total_freight_before],
-                names=['Material Cost', 'Freight Cost'],
-                color_discrete_sequence=['#1976D2', '#FF9800'],
-                hole=0.4
-            )
-            fig_before.update_layout(height=300)
-            st.plotly_chart(fig_before, use_container_width=True)
-        
-        with col2:
-            st.markdown("**After Increase**")
-            new_material_total = (df_impact['new_unit_material_cost'] * df_impact['total_quantity']).sum()
-            new_freight_total = (df_impact['new_unit_freight_cost'] * df_impact['total_quantity']).sum()
-            
-            fig_after = px.pie(
-                values=[new_material_total, new_freight_total],
-                names=['Material Cost', 'Freight Cost'],
-                color_discrete_sequence=['#1976D2', '#FF9800'],
-                hole=0.4
-            )
-            fig_after.update_layout(height=300)
-            st.plotly_chart(fig_after, use_container_width=True)
-        
-        # Status Migration Matrix
-        st.markdown("---")
-        st.subheader("🔄 Status Migration Matrix")
-        
-        migration = pd.crosstab(
-            df_impact['status_before'], 
-            df_impact['status_after'],
-            margins=True
-        )
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.dataframe(migration, use_container_width=True)
-        
-        with col2:
-            st.markdown("""
-            **Reading the Matrix:**
-            - Rows = Status BEFORE increase
-            - Columns = Status AFTER increase
-            - Diagonal = Products that maintained status
-            - Below diagonal = Status improved (rare)
-            - Above diagonal = Status worsened
-            """)
-        
-        # Status Change Visualization
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📉 Status Distribution Change")
-            
-            status_before = df_impact['status_before'].value_counts()
-            status_after = df_impact['status_after'].value_counts()
-            
-            status_order = ['EXCELLENT', 'GOOD', 'WARNING', 'CRITICAL', 'NEGATIVE']
-            
-            fig_status = go.Figure()
-            fig_status.add_trace(go.Bar(
-                name='Before',
-                x=[s for s in status_order if s in status_before.index],
-                y=[status_before.get(s, 0) for s in status_order if s in status_before.index],
-                marker_color='#1976D2'
-            ))
-            fig_status.add_trace(go.Bar(
-                name='After',
-                x=[s for s in status_order if s in status_after.index],
-                y=[status_after.get(s, 0) for s in status_order if s in status_after.index],
-                marker_color='#FF5722'
-            ))
-            fig_status.update_layout(barmode='group', height=400)
-            st.plotly_chart(fig_status, use_container_width=True)
-        
-        with col2:
-            st.subheader("⚡ GP% Change Distribution")
-            
-            fig_hist = px.histogram(
-                df_impact,
-                x='gp_pct_change',
-                nbins=30,
-                color_discrete_sequence=['#e53935']
-            )
-            fig_hist.update_layout(
-                height=400,
-                xaxis_title="GP% Change (points)",
-                yaxis_title="Number of Products"
-            )
-            fig_hist.add_vline(x=0, line_dash="dash", line_color="gray")
-            st.plotly_chart(fig_hist, use_container_width=True)
-        
-        # Risk Assessment
-        st.markdown("---")
-        st.subheader("⚠️ Risk Assessment: Products Most Affected")
-        
-        impact_display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 
-                               'calculated_gp_pct', 'new_gp_pct', 'gp_change', 'status_before', 'status_after']
-        impact_display_cols = [c for c in impact_display_cols if c in df_impact.columns]
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**🔴 Top 20 Products by GP Loss (USD)**")
-            top_losers = df_impact.nsmallest(20, 'gp_change')[impact_display_cols].copy()
-            
-            impact_col_rename = {
-                'pt_code': 'PT Code',
-                'product_name': 'Product',
-                'brand': 'Brand',
-                'package_size': 'Package',
-                'total_revenue': 'Revenue',
-                'calculated_gp_pct': 'GP% Before',
-                'new_gp_pct': 'GP% After',
-                'gp_change': 'GP Loss',
-                'status_before': 'Status Before',
-                'status_after': 'Status After'
-            }
-            top_losers = top_losers.rename(columns={k: v for k, v in impact_col_rename.items() if k in top_losers.columns})
-            if 'GP Loss' in top_losers.columns:
-                top_losers['GP Loss'] = top_losers['GP Loss'].apply(lambda x: f"${x:,.0f}")
-            st.dataframe(top_losers, use_container_width=True, hide_index=True)
-        
-        with col2:
-            st.markdown("**🚨 Products Turned Negative GP**")
-            turned_negative = df_impact[
-                (df_impact['calculated_gp_pct'] >= 0) & (df_impact['new_gp_pct'] < 0)
-            ]
-            
-            neg_display_cols = ['pt_code', 'product_name', 'brand', 'package_size', 'total_revenue', 
-                               'calculated_gp_pct', 'new_gp_pct', 'price_increase_needed']
-            neg_display_cols = [c for c in neg_display_cols if c in turned_negative.columns]
-            
-            if len(turned_negative) > 0:
-                turned_negative_display = turned_negative[neg_display_cols].copy()
-                neg_col_rename = {
-                    'pt_code': 'PT Code',
-                    'product_name': 'Product',
-                    'brand': 'Brand',
-                    'package_size': 'Package',
-                    'total_revenue': 'Revenue',
-                    'calculated_gp_pct': 'GP% Before',
-                    'new_gp_pct': 'GP% After',
-                    'price_increase_needed': 'Price Increase %'
-                }
-                turned_negative_display = turned_negative_display.rename(
-                    columns={k: v for k, v in neg_col_rename.items() if k in turned_negative_display.columns}
-                )
-                st.dataframe(turned_negative_display, use_container_width=True, hide_index=True)
-            else:
-                st.success("✅ No products turned negative with this cost increase scenario!")
-        
-        # Summary Alert
-        if products_turned_negative > 0 or gp_pct_after < 15:
-            st.markdown(f"""
-            <div class="alert-box">
-            <h4>⚠️ ACTION REQUIRED</h4>
-            <p>With Material +{material_increase}% and Freight +{freight_increase}% cost increase:</p>
-            <ul>
-                <li><strong>{products_turned_negative}</strong> products will have NEGATIVE gross profit</li>
-                <li>Overall GP% will drop from <strong>{gp_pct_before:.1f}%</strong> to <strong>{gp_pct_after:.1f}%</strong></li>
-                <li>Total GP loss: <strong>${abs(total_gp_loss):,.0f}</strong></li>
-            </ul>
-            </div>
-            """, unsafe_allow_html=True)
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
     
-    # ================== TAB 3: ĐỀ XUẤT GIÁ BÁN ==================
-    with tab3:
-        st.header("💰 Đề Xuất Giá Bán Mới")
+    where_clause = build_where_clause()
+    
+    # Build dynamic SELECT - include package_size
+    select_cols = ['pt_code', 'inv_date']
+    optional_cols = [
+        'product_pn', 'product_name', 'brand_name', 'brand',
+        'package_size', 'pkg_size',  # Added package size
+        'inv_unit_price', 'selling_unit_price', 
+        'average_landed_cost_usd', 'total_cogs_per_unit_usd', 
+        'logistics_cost_per_unit_usd', 'gross_profit_percent',
+        'adjusted_gross_profit_percent', 'invoiced_gross_profit_usd',
+        'calculated_invoiced_amount_usd', 'invoiced_quantity'
+    ]
+    
+    for col in optional_cols:
+        if col in columns:
+            select_cols.append(col)
+    
+    select_str = ", ".join(select_cols)
+    
+    cursor.execute(f"""
+        SELECT {select_str}
+        FROM sales_invoice_full_looker_view
+        WHERE {where_clause}
+        ORDER BY inv_date DESC
+    """)
+    sales_data = cursor.fetchall()
+    
+    if sales_data:
+        df_sales = pd.DataFrame(sales_data)
+        df_sales = convert_decimals(df_sales)
+        df_sales['inv_date'] = pd.to_datetime(df_sales['inv_date'])
         
-        st.markdown(f"""
-        <div class="info-box">
-        <h4>📋 Phương pháp tính giá đề xuất</h4>
-        <p>Giá bán đề xuất được tính dựa trên:</p>
-        <ul>
-            <li><strong>Chi phí mới</strong> = Chi phí hiện tại × (1 + % tăng Material) × (1 + % tăng Freight)</li>
-            <li><strong>Giá đề xuất</strong> = Chi phí mới / (1 - Target GP%)</li>
-            <li>Áp dụng kịch bản: Material +{material_increase}%, Freight +{freight_increase}%</li>
-        </ul>
-        </div>
-        """, unsafe_allow_html=True)
+        prod_col = 'product_pn' if 'product_pn' in df_sales.columns else 'product_name' if 'product_name' in df_sales.columns else 'pt_code'
+        brand_display_col = 'brand_name' if 'brand_name' in df_sales.columns else 'brand' if 'brand' in df_sales.columns else None
+        pkg_display_col = 'package_size' if 'package_size' in df_sales.columns else 'pkg_size' if 'pkg_size' in df_sales.columns else None
         
-        # Pricing Settings
-        st.subheader("⚙️ Cài đặt Target GP%")
+        # ========= DATA QUALITY WARNING =========
+        if 'gross_profit_percent' in df_sales.columns:
+            gp_100_count = len(df_sales[df_sales['gross_profit_percent'] >= 100])
+            total_count = len(df_sales)
+            gp_100_pct = gp_100_count / total_count * 100 if total_count > 0 else 0
+            
+            if gp_100_pct > 10:
+                st.warning(f"""
+                    ⚠️ **Data Quality Alert**: {gp_100_count:,} transactions ({gp_100_pct:.1f}%) have GP = 100%
+                    
+                    This means **Cost = $0** for these items. Possible reasons:
+                    - No BOM (Bill of Materials) defined
+                    - Missing Costbook prices  
+                    - average_landed_cost_usd = 0
+                    
+                    👉 Use "GP Filter" in sidebar to filter these out, or check "Data Quality" tab
+                """)
         
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            target_gp_1 = st.number_input("Target GP% 1", value=15, min_value=5, max_value=50, step=1)
-        with col2:
-            target_gp_2 = st.number_input("Target GP% 2", value=20, min_value=5, max_value=50, step=1)
-        with col3:
-            target_gp_3 = st.number_input("Target GP% 3", value=25, min_value=5, max_value=50, step=1)
-        with col4:
-            target_gp_4 = st.number_input("Target GP% 4", value=30, min_value=5, max_value=50, step=1)
-        
-        # Calculate recommended prices
-        df_pricing = df_impact.copy()
-        
-        # Current average selling price
-        df_pricing['current_avg_price'] = df_pricing['total_revenue'] / df_pricing['total_quantity']
-        
-        # New unit cost after increase
-        df_pricing['new_unit_cost'] = df_pricing['new_unit_total_cost']
-        
-        # Calculate prices for each target GP
-        df_pricing[f'price_for_{target_gp_1}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_1/100)
-        df_pricing[f'price_for_{target_gp_2}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_2/100)
-        df_pricing[f'price_for_{target_gp_3}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_3/100)
-        df_pricing[f'price_for_{target_gp_4}pct'] = df_pricing['new_unit_cost'] / (1 - target_gp_4/100)
-        
-        # Calculate price increase percentages
-        df_pricing[f'increase_for_{target_gp_1}pct'] = ((df_pricing[f'price_for_{target_gp_1}pct'] / df_pricing['current_avg_price']) - 1) * 100
-        df_pricing[f'increase_for_{target_gp_2}pct'] = ((df_pricing[f'price_for_{target_gp_2}pct'] / df_pricing['current_avg_price']) - 1) * 100
-        df_pricing[f'increase_for_{target_gp_3}pct'] = ((df_pricing[f'price_for_{target_gp_3}pct'] / df_pricing['current_avg_price']) - 1) * 100
-        df_pricing[f'increase_for_{target_gp_4}pct'] = ((df_pricing[f'price_for_{target_gp_4}pct'] / df_pricing['current_avg_price']) - 1) * 100
-        
-        # Priority classification
-        def classify_priority(row):
-            if row['new_gp_pct'] < 0:
-                return '🔴 CRITICAL - Lỗ'
-            elif row['new_gp_pct'] < 10:
-                return '🟠 HIGH - GP < 10%'
-            elif row['new_gp_pct'] < 15:
-                return '🟡 MEDIUM - GP < 15%'
-            elif row['new_gp_pct'] < 20:
-                return '🟢 LOW - GP < 20%'
-            else:
-                return '✅ OK - GP >= 20%'
-        
-        df_pricing['priority'] = df_pricing.apply(classify_priority, axis=1)
-        df_pricing['priority_order'] = df_pricing['priority'].map({
-            '🔴 CRITICAL - Lỗ': 1,
-            '🟠 HIGH - GP < 10%': 2,
-            '🟡 MEDIUM - GP < 15%': 3,
-            '🟢 LOW - GP < 20%': 4,
-            '✅ OK - GP >= 20%': 5
-        })
-        
-        # Summary metrics
-        st.markdown("---")
-        st.subheader("📊 Tổng quan sản phẩm cần điều chỉnh giá")
+        # KPI Metrics - EXCLUDE 100% GP for accurate metrics
+        df_valid = df_sales[df_sales['gross_profit_percent'] < 100] if 'gross_profit_percent' in df_sales.columns else df_sales
         
         col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            if 'gross_profit_percent' in df_valid.columns and len(df_valid) > 0:
+                avg_gp = df_valid['gross_profit_percent'].mean()
+                st.metric("📊 Avg GP% (Valid)", f"{avg_gp:.2f}%")
+            else:
+                st.metric("📊 Avg GP%", "N/A")
+        with col2:
+            if 'invoiced_gross_profit_usd' in df_valid.columns:
+                total_gp_usd = df_valid['invoiced_gross_profit_usd'].sum()
+                st.metric("💵 Total GP (USD)", f"${total_gp_usd:,.2f}")
+            else:
+                st.metric("💵 Total GP (USD)", "N/A")
+        with col3:
+            if 'calculated_invoiced_amount_usd' in df_valid.columns:
+                total_revenue = df_valid['calculated_invoiced_amount_usd'].sum()
+                st.metric("📈 Revenue (USD)", f"${total_revenue:,.2f}")
+            else:
+                st.metric("📈 Revenue (USD)", "N/A")
+        with col4:
+            st.metric("📋 Total Transactions", f"{len(df_sales):,}")
+        with col5:
+            st.metric("✅ Valid (GP<100%)", f"{len(df_valid):,}")
         
-        critical_count = len(df_pricing[df_pricing['new_gp_pct'] < 0])
-        high_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 0) & (df_pricing['new_gp_pct'] < 10)])
-        medium_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 10) & (df_pricing['new_gp_pct'] < 15)])
-        low_count = len(df_pricing[(df_pricing['new_gp_pct'] >= 15) & (df_pricing['new_gp_pct'] < 20)])
-        ok_count = len(df_pricing[df_pricing['new_gp_pct'] >= 20])
+        st.markdown("---")
+        
+        # Use df_valid for charts (exclude 100% GP)
+        df_chart = df_valid if len(df_valid) > 0 else df_sales
+        
+        # Charts Row 1
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.metric("🔴 CRITICAL (Lỗ)", f"{critical_count}", delta="Cần xử lý ngay")
+            st.subheader("📈 GP% Trend Over Time")
+            if 'gross_profit_percent' in df_chart.columns and len(df_chart) > 0:
+                agg_dict = {'gross_profit_percent': 'mean'}
+                if 'invoiced_gross_profit_usd' in df_chart.columns:
+                    agg_dict['invoiced_gross_profit_usd'] = 'sum'
+                if 'calculated_invoiced_amount_usd' in df_chart.columns:
+                    agg_dict['calculated_invoiced_amount_usd'] = 'sum'
+                
+                df_monthly = df_chart.groupby(df_chart['inv_date'].dt.to_period('M')).agg(agg_dict).reset_index()
+                df_monthly['inv_date'] = df_monthly['inv_date'].astype(str)
+                
+                fig_trend = go.Figure()
+                fig_trend.add_trace(go.Scatter(
+                    x=df_monthly['inv_date'], 
+                    y=df_monthly['gross_profit_percent'],
+                    mode='lines+markers',
+                    name='GP%',
+                    line=dict(color='#2E86AB', width=3),
+                    marker=dict(size=8)
+                ))
+                fig_trend.add_hline(y=25, line_dash="dash", line_color="green", annotation_text="Target 25%")
+                fig_trend.update_layout(
+                    xaxis_title="Month",
+                    yaxis_title="GP%",
+                    hovermode='x unified',
+                    height=350
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+            else:
+                st.info("No valid GP data")
+        
         with col2:
-            st.metric("🟠 HIGH (GP<10%)", f"{high_count}", delta="Ưu tiên cao")
-        with col3:
-            st.metric("🟡 MEDIUM (GP<15%)", f"{medium_count}", delta="Cần review")
-        with col4:
-            st.metric("🟢 LOW (GP<20%)", f"{low_count}", delta="Theo dõi")
-        with col5:
-            st.metric("✅ OK (GP>=20%)", f"{ok_count}", delta="Ổn định")
+            st.subheader("💰 Revenue vs GP by Month")
+            if 'calculated_invoiced_amount_usd' in df_chart.columns and 'invoiced_gross_profit_usd' in df_chart.columns and len(df_chart) > 0:
+                fig_revenue = go.Figure()
+                fig_revenue.add_trace(go.Bar(
+                    x=df_monthly['inv_date'],
+                    y=df_monthly['calculated_invoiced_amount_usd'],
+                    name='Revenue (USD)',
+                    marker_color='#28A745'
+                ))
+                fig_revenue.add_trace(go.Bar(
+                    x=df_monthly['inv_date'],
+                    y=df_monthly['invoiced_gross_profit_usd'],
+                    name='GP (USD)',
+                    marker_color='#FFC107'
+                ))
+                fig_revenue.update_layout(
+                    barmode='group',
+                    xaxis_title="Month",
+                    yaxis_title="USD",
+                    height=350
+                )
+                st.plotly_chart(fig_revenue, use_container_width=True)
+            else:
+                st.info("Revenue data not available")
         
-        # Filter by priority
+        # Charts Row 2 - ADD PACKAGE SIZE ANALYSIS
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📊 GP% Distribution (Valid Only)")
+            if 'gross_profit_percent' in df_chart.columns and len(df_chart) > 0:
+                fig_dist = px.histogram(
+                    df_chart, 
+                    x='gross_profit_percent', 
+                    nbins=30,
+                    color_discrete_sequence=['#2E86AB']
+                )
+                fig_dist.update_layout(
+                    xaxis_title="GP%",
+                    yaxis_title="Count",
+                    height=350
+                )
+                st.plotly_chart(fig_dist, use_container_width=True)
+            else:
+                st.info("No valid GP data")
+        
+        with col2:
+            # Package Size Analysis - NEW
+            if pkg_display_col and pkg_display_col in df_chart.columns:
+                st.subheader("📦 GP% by Package Size")
+                df_pkg = df_chart.groupby(pkg_display_col).agg({
+                    'gross_profit_percent': 'mean',
+                    'calculated_invoiced_amount_usd': 'sum' if 'calculated_invoiced_amount_usd' in df_chart.columns else 'count'
+                }).reset_index()
+                df_pkg = df_pkg.sort_values('gross_profit_percent', ascending=False)
+                
+                fig_pkg = px.bar(
+                    df_pkg.head(15),
+                    x=pkg_display_col,
+                    y='gross_profit_percent',
+                    color='gross_profit_percent',
+                    color_continuous_scale='RdYlGn',
+                    title='Average GP% by Package Size'
+                )
+                fig_pkg.update_layout(xaxis_tickangle=-45, height=350)
+                st.plotly_chart(fig_pkg, use_container_width=True)
+            else:
+                st.subheader("🏆 Top 10 Products by GP")
+                if 'invoiced_gross_profit_usd' in df_chart.columns and len(df_chart) > 0:
+                    df_top = df_chart.groupby(prod_col).agg({
+                        'invoiced_gross_profit_usd': 'sum'
+                    }).reset_index().nlargest(10, 'invoiced_gross_profit_usd')
+                    
+                    fig_top = px.bar(
+                        df_top,
+                        x='invoiced_gross_profit_usd',
+                        y=prod_col,
+                        orientation='h',
+                        color='invoiced_gross_profit_usd',
+                        color_continuous_scale='Greens'
+                    )
+                    fig_top.update_layout(
+                        xaxis_title="GP (USD)",
+                        yaxis_title="",
+                        height=350,
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig_top, use_container_width=True)
+        
+        # Charts Row 3 - Top Products + Brand Analysis
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🏆 Top 10 Products by GP")
+            if 'invoiced_gross_profit_usd' in df_chart.columns and len(df_chart) > 0:
+                df_top = df_chart.groupby(prod_col).agg({
+                    'invoiced_gross_profit_usd': 'sum'
+                }).reset_index().nlargest(10, 'invoiced_gross_profit_usd')
+                
+                fig_top = px.bar(
+                    df_top,
+                    x='invoiced_gross_profit_usd',
+                    y=prod_col,
+                    orientation='h',
+                    color='invoiced_gross_profit_usd',
+                    color_continuous_scale='Greens'
+                )
+                fig_top.update_layout(
+                    xaxis_title="GP (USD)",
+                    yaxis_title="",
+                    height=350,
+                    showlegend=False
+                )
+                st.plotly_chart(fig_top, use_container_width=True)
+        
+        with col2:
+            if brand_display_col and brand_display_col in df_chart.columns:
+                st.subheader("🏷️ GP% by Brand")
+                df_brand = df_chart.groupby(brand_display_col).agg({
+                    'gross_profit_percent': 'mean'
+                }).reset_index().sort_values('gross_profit_percent', ascending=False)
+                
+                fig_brand_bar = px.bar(
+                    df_brand.head(10),
+                    x=brand_display_col,
+                    y='gross_profit_percent',
+                    color='gross_profit_percent',
+                    color_continuous_scale='RdYlGn'
+                )
+                fig_brand_bar.update_layout(xaxis_tickangle=-45, height=350)
+                st.plotly_chart(fig_brand_bar, use_container_width=True)
+        
+        # GP Table - Include Package Size
         st.markdown("---")
-        st.subheader("🔍 Lọc theo mức độ ưu tiên")
+        st.subheader("🔍 GP Analysis by Product")
         
-        priority_filter = st.multiselect(
-            "Chọn mức độ ưu tiên:",
-            options=['🔴 CRITICAL - Lỗ', '🟠 HIGH - GP < 10%', '🟡 MEDIUM - GP < 15%', '🟢 LOW - GP < 20%', '✅ OK - GP >= 20%'],
-            default=['🔴 CRITICAL - Lỗ', '🟠 HIGH - GP < 10%', '🟡 MEDIUM - GP < 15%']
+        # Build groupby columns
+        groupby_cols = [prod_col, 'pt_code']
+        if pkg_display_col and pkg_display_col in df_sales.columns:
+            groupby_cols.append(pkg_display_col)
+        
+        agg_dict_prod = {}
+        if 'gross_profit_percent' in df_sales.columns:
+            agg_dict_prod['gross_profit_percent'] = 'mean'
+        if 'adjusted_gross_profit_percent' in df_sales.columns:
+            agg_dict_prod['adjusted_gross_profit_percent'] = 'mean'
+        if 'invoiced_gross_profit_usd' in df_sales.columns:
+            agg_dict_prod['invoiced_gross_profit_usd'] = 'sum'
+        if 'calculated_invoiced_amount_usd' in df_sales.columns:
+            agg_dict_prod['calculated_invoiced_amount_usd'] = 'sum'
+        if 'invoiced_quantity' in df_sales.columns:
+            agg_dict_prod['invoiced_quantity'] = 'sum'
+        if 'average_landed_cost_usd' in df_sales.columns:
+            agg_dict_prod['average_landed_cost_usd'] = 'mean'
+        
+        if agg_dict_prod:
+            df_product_gp = df_sales.groupby(groupby_cols).agg(agg_dict_prod).reset_index()
+            
+            if 'invoiced_gross_profit_usd' in df_product_gp.columns:
+                df_product_gp = df_product_gp.sort_values('invoiced_gross_profit_usd', ascending=False)
+            
+            # Add cost status column
+            if 'gross_profit_percent' in df_product_gp.columns:
+                df_product_gp['cost_status'] = df_product_gp['gross_profit_percent'].apply(
+                    lambda x: '⚠️ Missing Cost' if x >= 100 else '✅ Valid'
+                )
+            
+            def color_gp(val):
+                if pd.isna(val):
+                    return ''
+                if val >= 100:
+                    return 'background-color: #ff6b6b; color: white'
+                elif val >= 30:
+                    return 'background-color: #28a745; color: white'
+                elif val >= 20:
+                    return 'background-color: #ffc107; color: black'
+                elif val >= 10:
+                    return 'background-color: #fd7e14; color: white'
+                else:
+                    return 'background-color: #dc3545; color: white'
+            
+            format_dict = {}
+            if 'gross_profit_percent' in df_product_gp.columns:
+                format_dict['gross_profit_percent'] = '{:.2f}%'
+            if 'adjusted_gross_profit_percent' in df_product_gp.columns:
+                format_dict['adjusted_gross_profit_percent'] = '{:.2f}%'
+            if 'invoiced_gross_profit_usd' in df_product_gp.columns:
+                format_dict['invoiced_gross_profit_usd'] = '${:,.2f}'
+            if 'calculated_invoiced_amount_usd' in df_product_gp.columns:
+                format_dict['calculated_invoiced_amount_usd'] = '${:,.2f}'
+            if 'invoiced_quantity' in df_product_gp.columns:
+                format_dict['invoiced_quantity'] = '{:,.0f}'
+            if 'average_landed_cost_usd' in df_product_gp.columns:
+                format_dict['average_landed_cost_usd'] = '${:,.4f}'
+            
+            styled_df = df_product_gp.style.format(format_dict)
+            if 'gross_profit_percent' in df_product_gp.columns:
+                styled_df = styled_df.applymap(color_gp, subset=['gross_profit_percent'])
+            
+            st.dataframe(styled_df, use_container_width=True, height=400)
+        
+        # Insights
+        st.markdown("---")
+        st.subheader("💡 Key Insights")
+        
+        if 'gross_profit_percent' in df_sales.columns and 'invoiced_gross_profit_usd' in df_sales.columns:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.markdown("**🔴 Missing Cost (100%)**")
+                missing_cost = df_product_gp[df_product_gp['gross_profit_percent'] >= 100]
+                st.write(f"Count: {len(missing_cost)}")
+                st.write(f"Revenue: ${missing_cost['calculated_invoiced_amount_usd'].sum():,.2f}" if 'calculated_invoiced_amount_usd' in missing_cost.columns else "N/A")
+            
+            with col2:
+                st.markdown("**🟢 High GP (>30%)**")
+                high_gp = df_product_gp[(df_product_gp['gross_profit_percent'] >= 30) & (df_product_gp['gross_profit_percent'] < 100)]
+                st.write(f"Count: {len(high_gp)}")
+                st.write(f"GP: ${high_gp['invoiced_gross_profit_usd'].sum():,.2f}")
+            
+            with col3:
+                st.markdown("**🟡 Medium GP (20-30%)**")
+                med_gp = df_product_gp[(df_product_gp['gross_profit_percent'] >= 20) & (df_product_gp['gross_profit_percent'] < 30)]
+                st.write(f"Count: {len(med_gp)}")
+                st.write(f"GP: ${med_gp['invoiced_gross_profit_usd'].sum():,.2f}")
+            
+            with col4:
+                st.markdown("**🔴 Low GP (<20%)**")
+                low_gp = df_product_gp[(df_product_gp['gross_profit_percent'] < 20) & (df_product_gp['gross_profit_percent'] >= 0)]
+                st.write(f"Count: {len(low_gp)}")
+                st.write(f"GP: ${low_gp['invoiced_gross_profit_usd'].sum():,.2f}")
+    
+    else:
+        st.warning("No sales data found for selected filters")
+    
+    cursor.close()
+    conn.close()
+
+# ============== TAB 2: DATA QUALITY ==============
+with tab2:
+    st.header("⚠️ Data Quality Analysis")
+    
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    # Build SELECT with package_size if available
+    select_pkg = f", {package_size_col} as pkg_size" if package_size_col else ""
+    group_pkg = f", {package_size_col}" if package_size_col else ""
+    
+    # Get products with GP = 100%
+    cursor.execute(f"""
+        SELECT 
+            pt_code,
+            product_pn,
+            brand
+            {select_pkg},
+            COUNT(*) as transaction_count,
+            SUM(calculated_invoiced_amount_usd) as total_revenue,
+            AVG(gross_profit_percent) as avg_gp,
+            AVG(average_landed_cost_usd) as avg_landed_cost,
+            AVG(total_cogs_per_unit_usd) as avg_cogs
+        FROM sales_invoice_full_looker_view
+        WHERE legal_entity_id = 43
+        AND gross_profit_percent >= 100
+        GROUP BY pt_code, product_pn, brand {group_pkg}
+        ORDER BY total_revenue DESC
+        LIMIT 100
+    """)
+    missing_cost_data = cursor.fetchall()
+    
+    if missing_cost_data:
+        df_missing = pd.DataFrame(missing_cost_data)
+        df_missing = convert_decimals(df_missing)
+        
+        # Summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🔴 Products with GP=100%", f"{len(df_missing):,}")
+        with col2:
+            total_revenue_missing = df_missing['total_revenue'].sum()
+            st.metric("💰 Revenue Affected", f"${total_revenue_missing:,.2f}")
+        with col3:
+            total_trans = df_missing['transaction_count'].sum()
+            st.metric("📋 Transactions Affected", f"{total_trans:,}")
+        
+        st.markdown("---")
+        
+        # Check why cost is missing
+        st.subheader("🔍 Root Cause Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Check BOM existence
+            pt_codes = df_missing['pt_code'].tolist()[:50]
+            if pt_codes:
+                pt_code_list = "','".join(pt_codes)
+                cursor.execute(f"""
+                    SELECT p.pt_code, 
+                           CASE WHEN bh.id IS NOT NULL THEN 'Has BOM' ELSE 'No BOM' END as bom_status
+                    FROM products p
+                    LEFT JOIN bom_headers bh ON p.id = bh.product_id AND bh.status = 'ACTIVE' AND bh.delete_flag = 0
+                    WHERE p.pt_code IN ('{pt_code_list}')
+                """)
+                bom_check = cursor.fetchall()
+                
+                if bom_check:
+                    df_bom = pd.DataFrame(bom_check)
+                    bom_summary = df_bom['bom_status'].value_counts()
+                    
+                    fig_bom = px.pie(
+                        values=bom_summary.values,
+                        names=bom_summary.index,
+                        title='BOM Status for GP=100% Products',
+                        color_discrete_map={'Has BOM': '#28a745', 'No BOM': '#dc3545'}
+                    )
+                    st.plotly_chart(fig_bom, use_container_width=True)
+        
+        with col2:
+            # Check by Package Size if available
+            if 'pkg_size' in df_missing.columns:
+                st.subheader("📦 Missing Cost by Package Size")
+                pkg_summary = df_missing.groupby('pkg_size').agg({
+                    'total_revenue': 'sum',
+                    'transaction_count': 'sum'
+                }).reset_index().sort_values('total_revenue', ascending=False)
+                
+                fig_pkg = px.bar(
+                    pkg_summary.head(10),
+                    x='pkg_size',
+                    y='total_revenue',
+                    title='Revenue Affected by Package Size',
+                    color='total_revenue',
+                    color_continuous_scale='Reds'
+                )
+                fig_pkg.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig_pkg, use_container_width=True)
+            else:
+                st.markdown("**💵 Cost Data Status**")
+                avg_landed = df_missing['avg_landed_cost'].mean()
+                avg_cogs = df_missing['avg_cogs'].mean()
+                
+                st.write(f"- Average Landed Cost: ${avg_landed:.4f}" if avg_landed else "- Average Landed Cost: $0.00")
+                st.write(f"- Average COGS: ${avg_cogs:.4f}" if avg_cogs else "- Average COGS: $0.00")
+                
+                if avg_landed == 0 or pd.isna(avg_landed):
+                    st.error("❌ Landed Cost = 0 → No Costbook prices or BOM not costed")
+        
+        # Products needing attention
+        st.markdown("---")
+        st.subheader("📋 Products Needing Cost Setup (Top 100 by Revenue)")
+        
+        format_dict = {
+            'total_revenue': '${:,.2f}',
+            'avg_gp': '{:.1f}%',
+            'avg_landed_cost': '${:.4f}',
+            'avg_cogs': '${:.4f}',
+            'transaction_count': '{:,}'
+        }
+        
+        st.dataframe(
+            df_missing.style.format(format_dict),
+            use_container_width=True,
+            height=400
         )
         
-        if priority_filter:
-            df_pricing_filtered = df_pricing[df_pricing['priority'].isin(priority_filter)].copy()
-        else:
-            df_pricing_filtered = df_pricing.copy()
-        
-        df_pricing_filtered = df_pricing_filtered.sort_values(['priority_order', 'new_gp_pct'])
-        
-        # Main pricing table
+        # Action items
         st.markdown("---")
-        st.subheader(f"📋 Bảng Đề Xuất Giá Bán ({len(df_pricing_filtered)} sản phẩm)")
+        st.subheader("✅ Action Items")
+        st.markdown("""
+        1. **Create BOM** for products without Bill of Materials
+        2. **Update Costbook** with current material prices
+        3. **Review logistics costs** - ensure freight/duty allocated
+        4. **Re-run cost calculation** after updates
+        """)
+    else:
+        st.success("✅ No products with GP=100% found!")
+    
+    cursor.close()
+    conn.close()
+
+# ============== TAB 3: COST ANALYSIS ==============
+with tab3:
+    st.header("BOM Cost Analysis")
+    
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    # Include package_size in product selection
+    cursor.execute("""
+        SELECT DISTINCT p.name as product_name, p.pt_code, p.package_size
+        FROM bom_headers bh
+        JOIN products p ON bh.product_id = p.id
+        WHERE bh.status = 'ACTIVE' AND bh.delete_flag = 0
+        ORDER BY p.name
+    """)
+    products = cursor.fetchall()
+    
+    if products:
+        product_options = {f"{p['product_name']} ({p['pt_code']}) - {p['package_size'] or 'N/A'}": p['pt_code'] for p in products}
+        selected = st.selectbox("Select Product", list(product_options.keys()))
+        selected_pt_code = product_options[selected]
         
-        # Prepare display dataframe
-        pricing_display = df_pricing_filtered[[
-            'pt_code', 'product_name', 'brand', 'package_size',
-            'total_revenue', 'total_quantity',
-            'current_avg_price', 'new_unit_cost',
-            'calculated_gp_pct', 'new_gp_pct',
-            f'price_for_{target_gp_1}pct', f'price_for_{target_gp_2}pct', 
-            f'price_for_{target_gp_3}pct', f'price_for_{target_gp_4}pct',
-            f'increase_for_{target_gp_2}pct',
-            'priority'
-        ]].copy()
-        
-        # Rename columns for display
-        pricing_display.columns = [
-            'PT Code', 'Tên Sản Phẩm', 'Brand', 'Package',
-            'Doanh Thu', 'Số Lượng',
-            'Giá TB Hiện Tại', 'Chi Phí Mới/Unit',
-            'GP% Hiện Tại', 'GP% Sau Tăng CP',
-            f'Giá Đề Xuất ({target_gp_1}%)', f'Giá Đề Xuất ({target_gp_2}%)',
-            f'Giá Đề Xuất ({target_gp_3}%)', f'Giá Đề Xuất ({target_gp_4}%)',
-            f'% Tăng Giá (Target {target_gp_2}%)',
-            'Mức Độ Ưu Tiên'
-        ]
-        
-        # Format numeric columns
-        for col in ['Doanh Thu', 'Giá TB Hiện Tại', 'Chi Phí Mới/Unit',
-                    f'Giá Đề Xuất ({target_gp_1}%)', f'Giá Đề Xuất ({target_gp_2}%)',
-                    f'Giá Đề Xuất ({target_gp_3}%)', f'Giá Đề Xuất ({target_gp_4}%)']:
-            if col in pricing_display.columns:
-                pricing_display[col] = pricing_display[col].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "N/A")
-        
-        for col in ['GP% Hiện Tại', 'GP% Sau Tăng CP', f'% Tăng Giá (Target {target_gp_2}%)']:
-            if col in pricing_display.columns:
-                pricing_display[col] = pricing_display[col].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "N/A")
-        
-        st.dataframe(pricing_display, use_container_width=True, hide_index=True, height=500)
-        
-        # Download section
-        st.markdown("---")
-        st.subheader("📥 Tải xuống báo cáo đề xuất giá")
-        
-        # Prepare export dataframe with all data
-        export_df = df_pricing_filtered[[
-            'pt_code', 'product_name', 'brand', 'package_size',
-            'total_revenue', 'total_quantity',
-            'current_avg_price', 'unit_material_cost', 'unit_freight_cost', 'unit_total_cost',
-            'new_unit_material_cost', 'new_unit_freight_cost', 'new_unit_cost',
-            'calculated_gp_pct', 'new_gp_pct',
-            f'price_for_{target_gp_1}pct', f'price_for_{target_gp_2}pct',
-            f'price_for_{target_gp_3}pct', f'price_for_{target_gp_4}pct',
-            f'increase_for_{target_gp_1}pct', f'increase_for_{target_gp_2}pct',
-            f'increase_for_{target_gp_3}pct', f'increase_for_{target_gp_4}pct',
-            'priority'
-        ]].copy()
-        
-        export_df.columns = [
-            'PT Code', 'Product Name', 'Brand', 'Package Size',
-            'Total Revenue USD', 'Total Quantity',
-            'Current Avg Price', 'Current Material Cost/Unit', 'Current Freight Cost/Unit', 'Current Total Cost/Unit',
-            'New Material Cost/Unit', 'New Freight Cost/Unit', 'New Total Cost/Unit',
-            'Current GP%', 'New GP% After Cost Increase',
-            f'Recommended Price ({target_gp_1}% GP)', f'Recommended Price ({target_gp_2}% GP)',
-            f'Recommended Price ({target_gp_3}% GP)', f'Recommended Price ({target_gp_4}% GP)',
-            f'Price Increase % for {target_gp_1}% GP', f'Price Increase % for {target_gp_2}% GP',
-            f'Price Increase % for {target_gp_3}% GP', f'Price Increase % for {target_gp_4}% GP',
-            'Priority Level'
-        ]
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            csv_export = export_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Tải CSV - Đề Xuất Giá Đầy Đủ",
-                data=csv_export,
-                file_name=f"price_recommendation_{material_increase}pct_material_{freight_increase}pct_freight.csv",
-                mime="text/csv"
+        cursor.execute("""
+            WITH material_max_price AS (
+                SELECT pt_code, 
+                       MAX(standard_unit_price_usd) as max_price,
+                       MAX(validity_status) as status
+                FROM costbook_full_view
+                GROUP BY pt_code
             )
+            SELECT 
+                p.name as finished_product,
+                p.pt_code as product_code,
+                p.package_size,
+                m.name as material_name,
+                m.pt_code as material_code,
+                bd.quantity,
+                bd.scrap_rate,
+                mp.max_price as unit_price,
+                mp.status as price_status,
+                bd.quantity * (1 + COALESCE(bd.scrap_rate, 0)/100) * COALESCE(mp.max_price, 0) as material_cost
+            FROM bom_headers bh
+            JOIN products p ON bh.product_id = p.id
+            JOIN bom_details bd ON bh.id = bd.bom_header_id
+            LEFT JOIN products m ON bd.material_id = m.id
+            LEFT JOIN material_max_price mp ON m.pt_code = mp.pt_code
+            WHERE bh.status = 'ACTIVE' 
+            AND bh.delete_flag = 0
+            AND p.pt_code = %s
+        """, (selected_pt_code,))
+        bom_data = cursor.fetchall()
         
-        with col2:
-            # Summary export
-            summary_data = {
-                'Metric': [
-                    'Total Products Analyzed',
-                    'Products Need Price Adjustment',
-                    'Critical (Negative GP)',
-                    'High Priority (GP < 10%)',
-                    'Medium Priority (GP < 15%)',
-                    f'Avg Price Increase for {target_gp_2}% GP',
-                    'Material Cost Increase Applied',
-                    'Freight Cost Increase Applied'
-                ],
-                'Value': [
-                    len(df_pricing),
-                    len(df_pricing[df_pricing['new_gp_pct'] < 20]),
-                    critical_count,
-                    high_count,
-                    medium_count,
-                    f"{df_pricing[f'increase_for_{target_gp_2}pct'].mean():.1f}%",
-                    f"{material_increase}%",
-                    f"{freight_increase}%"
-                ]
-            }
-            summary_df = pd.DataFrame(summary_data)
-            summary_csv = summary_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Tải CSV - Tóm Tắt",
-                data=summary_csv,
-                file_name=f"price_recommendation_summary.csv",
-                mime="text/csv"
-            )
-        
-        # Visual: Price Increase Distribution
-        st.markdown("---")
-        st.subheader("📈 Phân bổ mức tăng giá đề xuất")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig_increase = px.histogram(
-                df_pricing_filtered,
-                x=f'increase_for_{target_gp_2}pct',
-                nbins=25,
-                color='priority',
-                title=f"Phân bổ % Tăng Giá để đạt {target_gp_2}% GP",
-                labels={f'increase_for_{target_gp_2}pct': '% Tăng Giá'},
-                color_discrete_sequence=['#e53935', '#FB8C00', '#FDD835', '#7CB342', '#43A047']
-            )
-            fig_increase.update_layout(height=400)
-            st.plotly_chart(fig_increase, use_container_width=True)
-        
-        with col2:
-            # Scatter: Current GP vs Required Price Increase
-            fig_scatter = px.scatter(
-                df_pricing_filtered,
-                x='new_gp_pct',
-                y=f'increase_for_{target_gp_2}pct',
-                size='total_revenue',
-                color='priority',
-                hover_data=['pt_code', 'product_name', 'brand'],
-                title=f"GP% Mới vs % Tăng Giá Cần Thiết (Target {target_gp_2}%)",
-                labels={
-                    'new_gp_pct': 'GP% Sau Tăng Chi Phí',
-                    f'increase_for_{target_gp_2}pct': '% Tăng Giá Cần Thiết'
-                },
-                color_discrete_sequence=['#e53935', '#FB8C00', '#FDD835', '#7CB342', '#43A047']
-            )
-            fig_scatter.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Không cần tăng")
-            fig_scatter.add_vline(x=target_gp_2, line_dash="dash", line_color="green", annotation_text=f"Target {target_gp_2}%")
-            fig_scatter.update_layout(height=400)
-            st.plotly_chart(fig_scatter, use_container_width=True)
-        
-        # Quick Action Items
-        st.markdown("---")
-        st.subheader("🎯 Hành động đề xuất")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown(f"""
-            <div class="alert-box">
-            <h4>🔴 Sản phẩm cần điều chỉnh giá NGAY ({critical_count + high_count} sản phẩm)</h4>
-            <ul>
-                <li><strong>{critical_count}</strong> sản phẩm đang LỖ sau khi tăng chi phí</li>
-                <li><strong>{high_count}</strong> sản phẩm có GP% dưới 10%</li>
-                <li>Tổng doanh thu ảnh hưởng: <strong>${df_pricing[df_pricing['new_gp_pct'] < 10]['total_revenue'].sum():,.0f}</strong></li>
-            </ul>
-            <p><strong>➡️ Đề xuất:</strong> Tăng giá theo cột "Giá Đề Xuất ({target_gp_2}%)" hoặc đàm phán lại với nhà cung cấp</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            avg_increase_critical = df_pricing[df_pricing['new_gp_pct'] < 10][f'increase_for_{target_gp_2}pct'].mean()
-            avg_increase_all = df_pricing[f'increase_for_{target_gp_2}pct'].mean()
+        if bom_data:
+            df_bom = pd.DataFrame(bom_data)
+            df_bom = convert_decimals(df_bom)
             
-            st.markdown(f"""
-            <div class="info-box">
-            <h4>📊 Tóm tắt điều chỉnh giá</h4>
-            <table style="width:100%">
-                <tr><td>Mức tăng giá TB (sản phẩm critical):</td><td><strong>{avg_increase_critical:.1f}%</strong></td></tr>
-                <tr><td>Mức tăng giá TB (tất cả):</td><td><strong>{avg_increase_all:.1f}%</strong></td></tr>
-                <tr><td>Sản phẩm cần tăng >20%:</td><td><strong>{len(df_pricing[df_pricing[f'increase_for_{target_gp_2}pct'] > 20])}</strong></td></tr>
-                <tr><td>Sản phẩm không cần tăng:</td><td><strong>{len(df_pricing[df_pricing[f'increase_for_{target_gp_2}pct'] <= 0])}</strong></td></tr>
-            </table>
-            </div>
-            """, unsafe_allow_html=True)
+            total_material_cost = df_bom['material_cost'].sum()
+            package_size = df_bom['package_size'].iloc[0] if 'package_size' in df_bom.columns else 'N/A'
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("🏭 Total BOM Cost", f"${total_material_cost:.4f}")
+            with col2:
+                st.metric("📦 Package Size", str(package_size))
+            with col3:
+                cursor.execute("""
+                    SELECT AVG(average_landed_cost_usd) as avg_landed,
+                           AVG(logistics_cost_per_unit_usd) as avg_logistics
+                    FROM sales_invoice_full_looker_view
+                    WHERE pt_code = %s AND legal_entity_id = 43
+                """, (selected_pt_code,))
+                cost_data = cursor.fetchone()
+                if cost_data and cost_data['avg_landed']:
+                    st.metric("📦 Avg Landed Cost (Invoice)", f"${float(cost_data['avg_landed']):.4f}")
+                else:
+                    st.metric("📦 Avg Landed Cost", "N/A (GP=100%)")
+            with col4:
+                st.metric("🧩 Materials Count", len(df_bom))
+            
+            st.markdown("---")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("📊 Cost Breakdown")
+                df_chart = df_bom[df_bom['material_cost'] > 0].nlargest(10, 'material_cost')
+                if not df_chart.empty:
+                    fig_pie = px.pie(df_chart, values='material_cost', names='material_name')
+                    fig_pie.update_layout(height=400)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.warning("⚠️ All materials have $0 cost - check Costbook!")
+            
+            with col2:
+                st.subheader("📈 Material Cost Comparison")
+                if not df_chart.empty:
+                    fig_bar = px.bar(df_chart, x='material_name', y='material_cost', color='material_cost')
+                    fig_bar.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(fig_bar, use_container_width=True)
+            
+            # BOM Table
+            st.subheader("📋 BOM Details")
+            st.dataframe(
+                df_bom[['material_name', 'material_code', 'quantity', 'scrap_rate', 'unit_price', 'price_status', 'material_cost']].style.format({
+                    'quantity': '{:.4f}',
+                    'scrap_rate': '{:.2f}%',
+                    'unit_price': '${:.4f}',
+                    'material_cost': '${:.4f}'
+                }),
+                use_container_width=True
+            )
+            
+            # Warnings
+            missing = df_bom[df_bom['unit_price'].isna() | (df_bom['unit_price'] == 0)]
+            if not missing.empty:
+                st.error(f"❌ {len(missing)} materials missing Costbook prices!")
+                st.dataframe(missing[['material_name', 'material_code']])
+        else:
+            st.info("No BOM found")
+    else:
+        st.info("No products with BOM")
+    
+    cursor.close()
+    conn.close()
 
-if __name__ == "__main__":
-    main()
+# ============== TAB 4: COST SIMULATION ==============
+with tab4:
+    st.header("Cost Impact Simulation")
+    
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    cursor.execute("""
+        SELECT DISTINCT p.name as product_name, p.pt_code, p.package_size
+        FROM bom_headers bh
+        JOIN products p ON bh.product_id = p.id
+        WHERE bh.status = 'ACTIVE' AND bh.delete_flag = 0
+        ORDER BY p.name
+    """)
+    products = cursor.fetchall()
+    
+    if products:
+        product_options = {f"{p['product_name']} ({p['pt_code']}) - {p['package_size'] or 'N/A'}": p['pt_code'] for p in products}
+        selected = st.selectbox("Select Product for Simulation", list(product_options.keys()), key="sim_product")
+        selected_pt_code = product_options[selected]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            material_adj = st.slider("Material Cost Change (%)", -50, 100, 0)
+        with col2:
+            logistics_adj = st.slider("Logistics Cost Change (%)", -50, 100, 0)
+        
+        cursor.execute("""
+            WITH material_max_price AS (
+                SELECT pt_code, MAX(standard_unit_price_usd) as max_price
+                FROM costbook_full_view
+                GROUP BY pt_code
+            )
+            SELECT SUM(bd.quantity * (1 + COALESCE(bd.scrap_rate, 0)/100) * COALESCE(mp.max_price, 0)) as total_material_cost
+            FROM bom_headers bh
+            JOIN products p ON bh.product_id = p.id
+            JOIN bom_details bd ON bh.id = bd.bom_header_id
+            LEFT JOIN products m ON bd.material_id = m.id
+            LEFT JOIN material_max_price mp ON m.pt_code = mp.pt_code
+            WHERE bh.status = 'ACTIVE' AND bh.delete_flag = 0 AND p.pt_code = %s
+        """, (selected_pt_code,))
+        material_result = cursor.fetchone()
+        
+        cursor.execute("""
+            SELECT AVG(selling_unit_price) as avg_price, AVG(logistics_cost_per_unit_usd) as avg_logistics
+            FROM sales_invoice_full_looker_view
+            WHERE pt_code = %s AND legal_entity_id = 43
+        """, (selected_pt_code,))
+        sales_result = cursor.fetchone()
+        
+        base_material = float(material_result['total_material_cost'] or 0) if material_result else 0
+        base_logistics = float(sales_result['avg_logistics'] or 0) if sales_result and sales_result['avg_logistics'] else 0
+        selling_price = float(sales_result['avg_price'] or 0) if sales_result and sales_result['avg_price'] else 0
+        
+        adj_material = base_material * (1 + material_adj/100)
+        adj_logistics = base_logistics * (1 + logistics_adj/100)
+        base_total = base_material + base_logistics
+        adj_total = adj_material + adj_logistics
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.subheader("📊 Base")
+            st.metric("Material", f"${base_material:.4f}")
+            st.metric("Logistics", f"${base_logistics:.4f}")
+            st.metric("Total", f"${base_total:.4f}")
+        with col2:
+            st.subheader("🔄 Adjusted")
+            st.metric("Material", f"${adj_material:.4f}", f"${adj_material - base_material:+.4f}")
+            st.metric("Logistics", f"${adj_logistics:.4f}", f"${adj_logistics - base_logistics:+.4f}")
+            st.metric("Total", f"${adj_total:.4f}", f"${adj_total - base_total:+.4f}")
+        with col3:
+            st.subheader("📈 GP Impact")
+            if selling_price > 0:
+                base_gp = (selling_price - base_total) / selling_price * 100
+                adj_gp = (selling_price - adj_total) / selling_price * 100
+                st.metric("Base GP%", f"{base_gp:.2f}%")
+                st.metric("New GP%", f"{adj_gp:.2f}%", f"{adj_gp - base_gp:+.2f}%")
+            else:
+                st.info("No sales data")
+    
+    cursor.close()
+    conn.close()
 
+# ============== TAB 5: RECOMMENDATIONS ==============
+with tab5:
+    st.header("Pricing Recommendations")
+    
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    target_gp = st.slider("Target GP%", 10, 40, 25)
+    
+    cursor.execute("""
+        WITH material_max_price AS (
+            SELECT pt_code, MAX(standard_unit_price_usd) as max_price
+            FROM costbook_full_view
+            GROUP BY pt_code
+        ),
+        product_costs AS (
+            SELECT p.name as product_name, p.pt_code, p.package_size,
+                   SUM(bd.quantity * (1 + COALESCE(bd.scrap_rate, 0)/100) * COALESCE(mp.max_price, 0)) as bom_cost
+            FROM bom_headers bh
+            JOIN products p ON bh.product_id = p.id
+            JOIN bom_details bd ON bh.id = bd.bom_header_id
+            LEFT JOIN products m ON bd.material_id = m.id
+            LEFT JOIN material_max_price mp ON m.pt_code = mp.pt_code
+            WHERE bh.status = 'ACTIVE' AND bh.delete_flag = 0
+            GROUP BY p.id, p.name, p.pt_code, p.package_size
+        )
+        SELECT pc.product_name, pc.pt_code, pc.package_size, pc.bom_cost,
+               AVG(s.selling_unit_price) as current_price,
+               AVG(s.gross_profit_percent) as current_gp,
+               SUM(s.invoiced_gross_profit_usd) as total_gp
+        FROM product_costs pc
+        LEFT JOIN sales_invoice_full_looker_view s ON pc.pt_code = s.pt_code AND s.legal_entity_id = 43
+        GROUP BY pc.product_name, pc.pt_code, pc.package_size, pc.bom_cost
+        HAVING pc.bom_cost > 0 AND current_gp < 100
+        ORDER BY total_gp DESC
+        LIMIT 50
+    """)
+    recommendations = cursor.fetchall()
+    
+    if recommendations:
+        df_rec = pd.DataFrame(recommendations)
+        df_rec = convert_decimals(df_rec)
+        
+        df_rec['target_price'] = df_rec['bom_cost'] / (1 - target_gp/100)
+        df_rec['price_gap'] = df_rec['target_price'] - df_rec['current_price'].fillna(0)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            needs_increase = len(df_rec[df_rec['price_gap'] > 0])
+            st.metric("🔴 Need Price Increase", needs_increase)
+        with col2:
+            on_target = len(df_rec[(df_rec['current_gp'] >= target_gp - 5) & (df_rec['current_gp'] <= target_gp + 5)])
+            st.metric("🟡 Near Target", on_target)
+        with col3:
+            above = len(df_rec[df_rec['current_gp'] > target_gp])
+            st.metric("🟢 Above Target", above)
+        
+        st.dataframe(
+            df_rec[['product_name', 'pt_code', 'package_size', 'bom_cost', 'current_price', 'current_gp', 'target_price', 'price_gap']].style.format({
+                'bom_cost': '${:.2f}',
+                'current_price': '${:.2f}',
+                'current_gp': '{:.1f}%',
+                'target_price': '${:.2f}',
+                'price_gap': '${:+.2f}'
+            }),
+            use_container_width=True
+        )
+    
+    cursor.close()
+    conn.close()
